@@ -32,23 +32,23 @@ Specifies which cmdlet to use first for retrieving Send As permissions. Valid va
 specified cmdlet first, then fallback to the alternative if the first fails.
 
 .EXAMPLE
-.\Export-MailboxDelegationReport.ps1
+.\Invoke-MailboxDelegationReport.ps1
 Exports delegation report for all shared, room, and equipment mailboxes to current directory.
 
 .EXAMPLE
-.\Export-MailboxDelegationReport.ps1 -InputCsvPath "C:\temp\targetmailboxes.csv" -OutputPath "C:\Reports"
+.\Invoke-MailboxDelegationReport.ps1 -InputCsvPath "C:\temp\targetmailboxes.csv" -OutputPath "C:\Reports"
 Exports delegation report for mailboxes specified in the CSV file to the C:\Reports directory.
 
 .EXAMPLE
-.\Export-MailboxDelegationReport.ps1 -IncludeUsers -OutputPath "C:\Powershell\scriptlogs"
+.\Invoke-MailboxDelegationReport.ps1 -IncludeUsers -OutputPath "C:\Powershell\scriptlogs"
 Exports delegation report for shared, room, equipment, and user mailboxes to specified directory.
 
 .EXAMPLE
-.\Export-MailboxDelegationReport.ps1 -IncludeOrgData
+.\Invoke-MailboxDelegationReport.ps1 -IncludeOrgData
 Exports delegation report with organizational data (Manager, Office, Department) included.
 
 .EXAMPLE
-.\Export-MailboxDelegationReport.ps1 -InputCsvPath "C:\temp\users.csv" -ReverseLookup
+.\Invoke-MailboxDelegationReport.ps1 -InputCsvPath "C:\temp\users.csv" -ReverseLookup
 Performs reverse lookup to find all mailboxes, distribution groups, and dynamic distribution groups that users in the CSV have permissions on.
 
 .NOTES
