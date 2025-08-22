@@ -1,0 +1,44 @@
+# CSV files (contain sensitive data)
+*.csv
+
+# Claude Code session files
+CLAUDE.md
+.claude/
+*.claude-chat
+.claude-chat
+claude-chat-*
+
+# PowerShell script logs
+*.log
+*.txt
+
+# Output directories
+scriptlogs/
+logs/
+output/
+
+# Temporary files
+*.tmp
+*.temp
+~*
+
+# Windows system files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# PowerShell execution policy files
+*.ps1xml
+
+# Backup files
+*.bak
+*.backup
+
+# Personal/sensitive configuration files
+config.json
+settings.json
+credentials.json
+
+# Test files
+test*.ps1
+*test*.csv
