@@ -1,0 +1,315 @@
+<#
+.SYNOPSIS
+Updates primary SMTP addresses in on-premises Active Directory based on CSV input with new domain
+
+.DESCRIPTION
+This script takes a CSV file with email addresses and updates the primary SMTP address in on-premises
+Active Directory by swapping the domain. It checks if the new email address already exists in
+proxyAddresses before making changes and provides comprehensive logging.
+
+.PARAMETER InputCsvPath
+Path to CSV file containing email addresses with "email" column header
+
+.PARAMETER NewDomain
+The new domain to replace the existing domain in email addresses
+
+.PARAMETER UpdateUPN
+Switch to also update the UserPrincipalName to match the new primary SMTP address
+
+.PARAMETER LogPath
+Path for the log file. Defaults to current directory with timestamp
+
+.PARAMETER WhatIf
+Shows what would happen without making actual changes
+
+.PARAMETER Verbose
+Provides detailed output during execution
+
+.EXAMPLE
+.\Update-ADEmailAddresses.ps1 -InputCsvPath "emails.csv" -NewDomain "newdomain.com"
+
+.EXAMPLE
+.\Update-ADEmailAddresses.ps1 -InputCsvPath "emails.csv" -NewDomain "newdomain.com" -UpdateUPN -WhatIf
+
+.NOTES
+Requires Active Directory PowerShell module and appropriate permissions to modify user objects
+#>
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$InputCsvPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$NewDomain,
+
+    [switch]$UpdateUPN,
+
+    [string]$LogPath = ".\ADEmailUpdate_$(Get-Date -Format 'yyyyMMdd_HHmmss').log",
+
+    [switch]$WhatIf,
+
+    [switch]$Verbose
+)
+
+# Import Active Directory module
+try
+{
+    Import-Module ActiveDirectory -ErrorAction Stop
+    Write-Verbose "Active Directory module imported successfully"
+}
+catch
+{
+    Write-Error "Failed to import Active Directory module: $($_.Exception.Message)"
+    exit 1
+}
+
+# Function to write to log file with timestamp
+function Write-LogEntry
+{
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "$timestamp [$Level] $Message"
+
+    # Write to console
+    switch ($Level)
+    {
+        "ERROR" { Write-Error $Message }
+        "WARNING" { Write-Warning $Message }
+        default { Write-Host $logEntry }
+    }
+
+    # Write to log file
+    try
+    {
+        Add-Content -Path $LogPath -Value $logEntry -ErrorAction Stop
+    }
+    catch
+    {
+        Write-Warning "Failed to write to log file: $($_.Exception.Message)"
+    }
+}
+
+# Validate input CSV file
+if (-not (Test-Path $InputCsvPath))
+{
+    Write-LogEntry "Input CSV file not found: $InputCsvPath" "ERROR"
+    exit 1
+}
+
+Write-LogEntry "Starting AD email address update process"
+Write-LogEntry "Input CSV: $InputCsvPath"
+Write-LogEntry "New Domain: $NewDomain"
+Write-LogEntry "Update UPN: $UpdateUPN"
+Write-LogEntry "WhatIf Mode: $WhatIf"
+
+# Import CSV data
+try
+{
+    $csvData = Import-Csv -Path $InputCsvPath -ErrorAction Stop
+    Write-LogEntry "Successfully imported $($csvData.Count) records from CSV"
+    Write-Verbose "CSV imported with $($csvData.Count) records"
+}
+catch
+{
+    Write-LogEntry "Failed to import CSV file: $($_.Exception.Message)" "ERROR"
+    exit 1
+}
+
+# Validate CSV has email column
+if (-not ($csvData | Get-Member -Name "email" -MemberType NoteProperty))
+{
+    Write-LogEntry "CSV file must contain 'email' column header" "ERROR"
+    exit 1
+}
+
+# Initialize counters
+$processedCount = 0
+$successCount = 0
+$errorCount = 0
+$skippedCount = 0
+
+# Process each email address
+foreach ($record in $csvData)
+{
+    $processedCount++
+    $currentEmail = $record.email
+
+    if ([string]::IsNullOrWhiteSpace($currentEmail))
+    {
+        Write-LogEntry "Skipping empty email address at record $processedCount" "WARNING"
+        $skippedCount++
+        continue
+    }
+
+    Write-LogEntry "Processing email: $currentEmail"
+    Write-Verbose "Processing record $processedCount`: $currentEmail"
+
+    # Calculate new email address
+    try
+    {
+        $emailParts = $currentEmail -split "@"
+        if ($emailParts.Count -ne 2)
+        {
+            Write-LogEntry "Invalid email format: $currentEmail" "WARNING"
+            $skippedCount++
+            continue
+        }
+
+        $newEmail = "$($emailParts[0])@$NewDomain"
+        Write-Verbose "Calculated new email: $newEmail"
+    }
+    catch
+    {
+        Write-LogEntry "Failed to calculate new email for $currentEmail`: $($_.Exception.Message)" "ERROR"
+        $errorCount++
+        continue
+    }
+
+    # Find user in AD by current email
+    try
+    {
+        $adUser = Get-ADUser -Filter "mail -eq '$currentEmail' -or proxyAddresses -like 'SMTP:$currentEmail' -or UserPrincipalName -eq '$currentEmail'" -Properties mail, proxyAddresses, UserPrincipalName -ErrorAction Stop
+
+        if (-not $adUser)
+        {
+            Write-LogEntry "User not found in AD with email: $currentEmail" "WARNING"
+            $skippedCount++
+            continue
+        }
+
+        if ($adUser.Count -gt 1)
+        {
+            Write-LogEntry "Multiple users found with email $currentEmail. Skipping." "WARNING"
+            $skippedCount++
+            continue
+        }
+
+        Write-Verbose "Found AD user: $($adUser.SamAccountName)"
+    }
+    catch
+    {
+        Write-LogEntry "Error searching for user with email $currentEmail`: $($_.Exception.Message)" "ERROR"
+        $errorCount++
+        continue
+    }
+
+    # Check if new email already exists in proxyAddresses
+    $existingProxy = $adUser.proxyAddresses | Where-Object { $_ -like "*$newEmail" }
+    if ($existingProxy)
+    {
+        Write-LogEntry "New email $newEmail already exists in proxyAddresses for user $($adUser.SamAccountName). Skipping." "WARNING"
+        $skippedCount++
+        continue
+    }
+
+    # Prepare changes
+    try
+    {
+        # Get current proxyAddresses and identify old primary SMTP
+        $oldPrimarySMTP = $adUser.proxyAddresses | Where-Object { $_ -like "SMTP:*" }
+        $currentProxyAddresses = @($adUser.proxyAddresses | Where-Object { $_ -notlike "SMTP:*" })
+
+        # Log step 1: Remove old primary SMTP
+        if ($oldPrimarySMTP)
+        {
+            if ($WhatIf)
+            {
+                Write-LogEntry "WHATIF: Would remove old primary SMTP: $oldPrimarySMTP for user $($adUser.SamAccountName)"
+            }
+            else
+            {
+                Write-LogEntry "Step 1: Removing old primary SMTP: $oldPrimarySMTP for user $($adUser.SamAccountName)"
+            }
+        }
+
+        # Prepare new proxyAddresses array
+        $newProxyAddresses = @("SMTP:$newEmail") + $currentProxyAddresses
+
+        # Log step 2: Add new primary SMTP
+        if ($WhatIf)
+        {
+            Write-LogEntry "WHATIF: Would add new primary SMTP: SMTP:$newEmail for user $($adUser.SamAccountName)"
+        }
+        else
+        {
+            Write-LogEntry "Step 2: Adding new primary SMTP: SMTP:$newEmail for user $($adUser.SamAccountName)"
+        }
+
+        # Add old primary as secondary if it exists and is different from new email
+        if ($adUser.mail -and $adUser.mail -ne $newEmail)
+        {
+            $newProxyAddresses += "smtp:$($adUser.mail)"
+
+            # Log step 3: Add old as secondary
+            if ($WhatIf)
+            {
+                Write-LogEntry "WHATIF: Would add old email as secondary: smtp:$($adUser.mail) for user $($adUser.SamAccountName)"
+            }
+            else
+            {
+                Write-LogEntry "Step 3: Adding old email as secondary: smtp:$($adUser.mail) for user $($adUser.SamAccountName)"
+            }
+        }
+
+        $updateParams = @{
+            Identity = $adUser.SamAccountName
+            Replace = @{
+                mail = $newEmail
+                proxyAddresses = $newProxyAddresses
+            }
+        }
+
+        # Add UPN update if requested
+        if ($UpdateUPN)
+        {
+            $updateParams.Replace.UserPrincipalName = $newEmail
+
+            if ($WhatIf)
+            {
+                Write-LogEntry "WHATIF: Would update UPN to $newEmail for user $($adUser.SamAccountName)"
+            }
+            else
+            {
+                Write-LogEntry "Step 4: Updating UPN to $newEmail for user $($adUser.SamAccountName)"
+            }
+        }
+
+        # Apply changes
+        if ($WhatIf)
+        {
+            Write-LogEntry "WHATIF: All changes would be applied for user $($adUser.SamAccountName)"
+            $successCount++
+        }
+        else
+        {
+            Set-ADUser @updateParams -ErrorAction Stop
+            Write-LogEntry "SUCCESS: All changes applied successfully for user $($adUser.SamAccountName) - Email changed from $($adUser.mail) to $newEmail"
+            $successCount++
+        }
+    }
+    catch
+    {
+        Write-LogEntry "ERROR: Failed to update user $($adUser.SamAccountName): $($_.Exception.Message)" "ERROR"
+        $errorCount++
+    }
+}
+
+# Final summary
+Write-LogEntry "=== SUMMARY ==="
+Write-LogEntry "Total records processed: $processedCount"
+Write-LogEntry "Successful updates: $successCount"
+Write-LogEntry "Errors: $errorCount"
+Write-LogEntry "Skipped: $skippedCount"
+Write-LogEntry "Log file saved to: $LogPath"
+
+if ($WhatIf)
+{
+    Write-LogEntry "WhatIf mode was enabled - no actual changes were made"
+}
+
+Write-Host "`nScript completed. Check log file for details: $LogPath" -ForegroundColor Green
