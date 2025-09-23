@@ -19,11 +19,6 @@ Switch to also update the UserPrincipalName to match the new primary SMTP addres
 .PARAMETER LogPath
 Path for the log file. Defaults to current directory with timestamp
 
-.PARAMETER WhatIf
-Shows what would happen without making actual changes
-
-.PARAMETER Verbose
-Provides detailed output during execution
 
 .EXAMPLE
 .\Update-ADEmailAddresses.ps1 -InputCsvPath "emails.csv" -NewDomain "newdomain.com"
@@ -45,11 +40,7 @@ param(
 
     [switch]$UpdateUPN,
 
-    [string]$LogPath = ".\ADEmailUpdate_$(Get-Date -Format 'yyyyMMdd_HHmmss').log",
-
-    [switch]$WhatIf,
-
-    [switch]$Verbose
+    [string]$LogPath = ".\ADEmailUpdate_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 )
 
 # Import Active Directory module
@@ -105,7 +96,7 @@ Write-LogEntry "Starting AD email address update process"
 Write-LogEntry "Input CSV: $InputCsvPath"
 Write-LogEntry "New Domain: $NewDomain"
 Write-LogEntry "Update UPN: $UpdateUPN"
-Write-LogEntry "WhatIf Mode: $WhatIf"
+Write-LogEntry "WhatIf Mode: $WhatIfPreference"
 
 # Import CSV data
 try
@@ -217,7 +208,7 @@ foreach ($record in $csvData)
         # Log step 1: Remove old primary SMTP
         if ($oldPrimarySMTP)
         {
-            if ($WhatIf)
+            if ($WhatIfPreference)
             {
                 Write-LogEntry "WHATIF: Would remove old primary SMTP: $oldPrimarySMTP for user $($adUser.SamAccountName)"
             }
@@ -231,7 +222,7 @@ foreach ($record in $csvData)
         $newProxyAddresses = @("SMTP:$newEmail") + $currentProxyAddresses
 
         # Log step 2: Add new primary SMTP
-        if ($WhatIf)
+        if ($WhatIfPreference)
         {
             Write-LogEntry "WHATIF: Would add new primary SMTP: SMTP:$newEmail for user $($adUser.SamAccountName)"
         }
@@ -246,7 +237,7 @@ foreach ($record in $csvData)
             $newProxyAddresses += "smtp:$($adUser.mail)"
 
             # Log step 3: Add old as secondary
-            if ($WhatIf)
+            if ($WhatIfPreference)
             {
                 Write-LogEntry "WHATIF: Would add old email as secondary: smtp:$($adUser.mail) for user $($adUser.SamAccountName)"
             }
@@ -269,7 +260,7 @@ foreach ($record in $csvData)
         {
             $updateParams.Replace.UserPrincipalName = $newEmail
 
-            if ($WhatIf)
+            if ($WhatIfPreference)
             {
                 Write-LogEntry "WHATIF: Would update UPN to $newEmail for user $($adUser.SamAccountName)"
             }
@@ -280,7 +271,7 @@ foreach ($record in $csvData)
         }
 
         # Apply changes
-        if ($WhatIf)
+        if ($WhatIfPreference)
         {
             Write-LogEntry "WHATIF: All changes would be applied for user $($adUser.SamAccountName)"
             $successCount++
@@ -307,7 +298,7 @@ Write-LogEntry "Errors: $errorCount"
 Write-LogEntry "Skipped: $skippedCount"
 Write-LogEntry "Log file saved to: $LogPath"
 
-if ($WhatIf)
+if ($WhatIfPreference)
 {
     Write-LogEntry "WhatIf mode was enabled - no actual changes were made"
 }
