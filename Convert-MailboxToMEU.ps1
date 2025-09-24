@@ -27,7 +27,7 @@ Converts mailboxes listed in CSV file to MEUs with external forwarding.
 Converts mailboxes without confirmation prompts for each conversion.
 
 .NOTES
-Author: Exchange Online Administration
+Author: Hudson Bush, Seguri - hudson@seguri.io
 Requires: Exchange Online Management module, on-premises Exchange PowerShell session
 Prerequisites:
   - Active Exchange Online session (Connect-ExchangeOnline)

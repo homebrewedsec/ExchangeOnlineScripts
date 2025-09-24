@@ -26,6 +26,7 @@ Directory path for output files. Defaults to current directory.
 .\Update-ADEmailAddresses.ps1 -InputCsvPath "emails.csv" -NewDomain "newdomain.com" -UpdateUPN -WhatIf
 
 .NOTES
+Author: Hudson Bush, Seguri - hudson@seguri.io
 Requires Active Directory PowerShell module and appropriate permissions to modify user objects
 #>
 

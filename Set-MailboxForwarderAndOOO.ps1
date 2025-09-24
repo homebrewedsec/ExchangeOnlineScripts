@@ -30,6 +30,7 @@ Set-MailboxForwarderAndOOO.ps1 -InputCsvPath "users.csv" -Force
 Processes all users without confirmation prompts
 
 .NOTES
+Author: Hudson Bush, Seguri - hudson@seguri.io
 Requires active Exchange Online PowerShell session.
 Use Connect-ExchangeOnline before running this script.
 #>
