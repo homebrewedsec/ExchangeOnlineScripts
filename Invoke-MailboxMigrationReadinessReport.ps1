@@ -53,7 +53,7 @@ param(
     [string]$InputCsvPath,
 
     [Parameter()]
-    [string]$OutputPath = ".",
+    [string]$OutputPath = (Get-Location).Path,
 
     [Parameter()]
     [int]$SizeThresholdGB = 100,
