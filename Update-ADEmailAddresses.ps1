@@ -19,6 +19,12 @@ Switch to also update the UserPrincipalName to match the new primary SMTP addres
 .PARAMETER OutputPath
 Directory path for output files. Defaults to current directory.
 
+.PARAMETER WhatIf
+Shows what would be changed without making actual modifications
+
+.PARAMETER Verbose
+Provides detailed output during execution
+
 .EXAMPLE
 .\Update-ADEmailAddresses.ps1 -InputCsvPath "emails.csv" -NewDomain "newdomain.com"
 

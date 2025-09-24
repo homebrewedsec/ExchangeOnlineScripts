@@ -14,6 +14,15 @@ If not provided, script will prompt for individual mailbox conversion.
 .PARAMETER OutputPath
 Directory path where conversion reports will be saved. Defaults to current directory.
 
+.PARAMETER WhatIf
+Shows what would be changed without making actual modifications
+
+.PARAMETER Confirm
+Prompts for confirmation before making changes. Use -Confirm:$false to bypass prompts.
+
+.PARAMETER Verbose
+Provides detailed output during execution
+
 .EXAMPLE
 .\Convert-MailboxToMEU.ps1 -WhatIf
 Simulates MEU conversion without making changes, shows what would be processed.

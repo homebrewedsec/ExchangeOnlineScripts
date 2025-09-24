@@ -12,21 +12,24 @@ The script includes safety features like WhatIf mode and detailed logging.
 .PARAMETER InputCsvPath
 Path to the CSV file containing user data. CSV must have 'upn' and 'newemail' columns.
 
+.PARAMETER OutputPath
+Directory path for output logs. Defaults to current directory.
+
 .PARAMETER WhatIf
 Shows what would be changed without making actual modifications
 
-.PARAMETER Force
-Skips confirmation prompts for batch processing
+.PARAMETER Confirm
+Prompts for confirmation before making changes. Use -Confirm:$false to bypass prompts.
 
-.PARAMETER OutputPath
-Directory path for output logs. Defaults to current directory.
+.PARAMETER Verbose
+Provides detailed output during execution
 
 .EXAMPLE
 Set-MailboxForwarderAndOOO.ps1 -InputCsvPath "users.csv" -WhatIf
 Tests the script without making changes
 
 .EXAMPLE
-Set-MailboxForwarderAndOOO.ps1 -InputCsvPath "users.csv" -Force
+Set-MailboxForwarderAndOOO.ps1 -InputCsvPath "users.csv" -Confirm:$false
 Processes all users without confirmation prompts
 
 .NOTES
@@ -41,10 +44,7 @@ param(
     [string]$InputCsvPath,
 
     [Parameter()]
-    [string]$OutputPath = (Get-Location).Path,
-
-    [Parameter()]
-    [switch]$Force  # Used in ShouldProcess calls for confirmation prompts
+    [string]$OutputPath = (Get-Location).Path
 )
 
 # Initialize variables
@@ -128,7 +128,7 @@ foreach ($user in $csvData)
         Write-Information "Found mailbox: $($mailbox.DisplayName)" -InformationAction Continue -Tags @('Status')
 
         # Set email forwarding
-        if ($Force -or $PSCmdlet.ShouldProcess($upn, "Set forwarding to $newEmail"))
+        if ($PSCmdlet.ShouldProcess($upn, "Set forwarding to $newEmail"))
         {
             try
             {
@@ -151,7 +151,7 @@ foreach ($user in $csvData)
         }
 
         # Set out-of-office message (placeholder implementation)
-        if ($Force -or $PSCmdlet.ShouldProcess($upn, "Set out-of-office message"))
+        if ($PSCmdlet.ShouldProcess($upn, "Set out-of-office message"))
         {
             try
             {

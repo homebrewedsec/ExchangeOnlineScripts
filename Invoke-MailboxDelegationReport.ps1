@@ -31,6 +31,9 @@ Specifies which cmdlet to use first for retrieving Send As permissions. Valid va
 "RecipientPermission". Different Exchange Online environments may require different cmdlets. The script will try the
 specified cmdlet first, then fallback to the alternative if the first fails.
 
+.PARAMETER Verbose
+Provides detailed output during execution
+
 .EXAMPLE
 .\Invoke-MailboxDelegationReport.ps1
 Exports delegation report for all shared, room, and equipment mailboxes to current directory.
