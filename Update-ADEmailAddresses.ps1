@@ -73,7 +73,7 @@ function Write-LogEntry
     {
         "ERROR" { Write-Error $Message }
         "WARNING" { Write-Warning $Message }
-        default { Write-Host $logEntry }
+        default { Write-Information $logEntry -InformationAction Continue }
     }
 
     # Write to log file
@@ -301,4 +301,4 @@ if ($WhatIfPreference)
     Write-LogEntry "WhatIf mode was enabled - no actual changes were made"
 }
 
-Write-Host "`nScript completed. Check log file for details: $LogPath" -ForegroundColor Green
+Write-Information "`nScript completed. Check log file for details: $LogPath" -InformationAction Continue
