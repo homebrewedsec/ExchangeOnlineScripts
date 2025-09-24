@@ -40,7 +40,7 @@ param(
     [string]$InputCsvPath,
 
     [Parameter()]
-    [string]$OutputPath = ".",
+    [string]$OutputPath = (Get-Location).Path,
 
     [Parameter()]
     [switch]$Force  # Used in ShouldProcess calls for confirmation prompts

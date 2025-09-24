@@ -16,9 +16,8 @@ The new domain to replace the existing domain in email addresses
 .PARAMETER UpdateUPN
 Switch to also update the UserPrincipalName to match the new primary SMTP address
 
-.PARAMETER LogPath
-Path for the log file. Defaults to current directory with timestamp
-
+.PARAMETER OutputPath
+Directory path for output files. Defaults to current directory.
 
 .EXAMPLE
 .\Update-ADEmailAddresses.ps1 -InputCsvPath "emails.csv" -NewDomain "newdomain.com"
@@ -40,14 +39,16 @@ param(
 
     [switch]$UpdateUPN,
 
-    [string]$LogPath = ".\ADEmailUpdate_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    [string]$OutputPath = (Get-Location).Path
 )
+
+# Generate log file path
+$LogPath = Join-Path $OutputPath "ADEmailUpdate_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
 # Import Active Directory module
 try
 {
     Import-Module ActiveDirectory -ErrorAction Stop
-    Write-Verbose "Active Directory module imported successfully"
 }
 catch
 {
@@ -103,7 +104,6 @@ try
 {
     $csvData = Import-Csv -Path $InputCsvPath -ErrorAction Stop
     Write-LogEntry "Successfully imported $($csvData.Count) records from CSV"
-    Write-Verbose "CSV imported with $($csvData.Count) records"
 }
 catch
 {
@@ -138,7 +138,6 @@ foreach ($record in $csvData)
     }
 
     Write-LogEntry "Processing email: $currentEmail"
-    Write-Verbose "Processing record $processedCount`: $currentEmail"
 
     # Calculate new email address
     try
@@ -152,7 +151,6 @@ foreach ($record in $csvData)
         }
 
         $newEmail = "$($emailParts[0])@$NewDomain"
-        Write-Verbose "Calculated new email: $newEmail"
     }
     catch
     {
@@ -180,7 +178,6 @@ foreach ($record in $csvData)
             continue
         }
 
-        Write-Verbose "Found AD user: $($adUser.SamAccountName)"
     }
     catch
     {

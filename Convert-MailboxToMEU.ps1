@@ -12,13 +12,7 @@ Optional path to CSV file containing mailboxes to convert. CSV must have 'upn' a
 If not provided, script will prompt for individual mailbox conversion.
 
 .PARAMETER OutputPath
-Directory path where conversion reports will be saved. Defaults to C:\Powershell\scriptlogs\.
-
-.PARAMETER WhatIf
-Switch to run in simulation mode without making actual changes. Shows what would be converted.
-
-.PARAMETER Force
-Switch to bypass confirmation prompts for batch operations.
+Directory path where conversion reports will be saved. Defaults to current directory.
 
 .EXAMPLE
 .\Convert-MailboxToMEU.ps1 -WhatIf
@@ -29,7 +23,7 @@ Simulates MEU conversion without making changes, shows what would be processed.
 Converts mailboxes listed in CSV file to MEUs with external forwarding.
 
 .EXAMPLE
-.\Convert-MailboxToMEU.ps1 -InputCsvPath "C:\temp\conversion-list.csv" -Force
+.\Convert-MailboxToMEU.ps1 -InputCsvPath "C:\temp\conversion-list.csv" -Confirm:$false
 Converts mailboxes without confirmation prompts for each conversion.
 
 .NOTES
@@ -42,12 +36,10 @@ Prerequisites:
 Output: CSV reports of conversion results, deleted mailbox attributes, and any errors encountered
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
     [string]$InputCsvPath,
-    [string]$OutputPath = "C:\Powershell\scriptlogs",
-    [switch]$WhatIf,
-    [switch]$Force
+    [string]$OutputPath = (Get-Location).Path
 )
 
 # Generate output file paths
@@ -57,7 +49,7 @@ $ErrorReportFile = Join-Path $OutputPath "MEUConversionErrors_$(Get-Date -Format
 
 Write-Information "Starting Mailbox to MEU Conversion Process..." -InformationAction Continue
 
-if ($WhatIf)
+if ($WhatIfPreference)
 {
     Write-Warning "Running in SIMULATION mode - no changes will be made"
 }
@@ -321,7 +313,7 @@ try
                 FullAccessDelegates = ($delegationInfo.FullAccessDelegates -join "; ")
                 SendAsDelegates = ($delegationInfo.SendAsDelegates -join "; ")
                 SendOnBehalfDelegates = ($delegationInfo.SendOnBehalfDelegates -join "; ")
-                ConversionStatus = if ($WhatIf) { "Simulated" } else { "Ready for Conversion" }
+                ConversionStatus = if ($WhatIfPreference) { "Simulated" } else { "Ready for Conversion" }
                 ConversionDate = $attributesToPreserve.ConversionDate
                 Notes = "Attributes analyzed and preserved"
             }
@@ -344,19 +336,16 @@ try
     # Phase 3: Configure external forwarding (simulation or actual)
     Write-Information "Phase 3: Configuring external forwarding..." -InformationAction Continue
 
-    if (-not $WhatIf)
+    if (-not $WhatIfPreference)
     {
-        if (-not $Force)
+        if ($PSCmdlet.ShouldProcess("$($conversionResults.Count) mailboxes", "Convert to MEU with external forwarding"))
         {
-            Write-Warning "WARNING: This will convert $($conversionResults.Count) mailboxes to MEUs with external forwarding."
-            Write-Warning "This action cannot be easily reversed. Original mailbox data will be moved to external addresses."
-            $confirmation = Read-Host "Do you want to proceed? (yes/no)"
-
-            if ($confirmation -ne "yes")
-            {
-                Write-Information "Conversion cancelled by user." -InformationAction Continue
-                exit 0
-            }
+            Write-Information "Proceeding with MEU conversion..." -InformationAction Continue
+        }
+        else
+        {
+            Write-Information "Conversion cancelled by user." -InformationAction Continue
+            exit 0
         }
 
         Write-Information "Proceeding with actual MEU conversion..." -InformationAction Continue
@@ -483,7 +472,7 @@ try
     Write-Information "  Total Mailboxes Processed: $($conversionResults.Count)" -InformationAction Continue
     Write-Information "  Successful Preparations: $(($conversionResults | Where-Object { $_.ConversionStatus -notlike '*Failed*' }).Count)" -InformationAction Continue
     Write-Information "  Errors Encountered: $($errorResults.Count)" -InformationAction Continue
-    Write-Information "  Mode: $(if ($WhatIf) { 'Simulation' } else { 'Live Conversion' })" -InformationAction Continue
+    Write-Information "  Mode: $(if ($WhatIfPreference) { 'Simulation' } else { 'Live Conversion' })" -InformationAction Continue
     Write-Information "  Conversion Report: $ConversionReportFile" -InformationAction Continue
     if ($deletedMailboxAttributes.Count -gt 0) { Write-Information "  Deleted Mailbox Attributes: $DeletedMailboxAttributesFile" -InformationAction Continue }
     if ($errorResults.Count -gt 0) { Write-Information "  Error Report: $ErrorReportFile" -InformationAction Continue }
