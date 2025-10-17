@@ -68,9 +68,30 @@ param(
     [switch]$IncludeUsers,
     [switch]$IncludeOrgData,
     [switch]$ReverseLookup,
+    [switch]$DiscoverMailboxes,
+    [switch]$PrepareForMigration,
     [ValidateSet("MailboxPermission", "RecipientPermission")]
     [string]$SendAsMethod = "MailboxPermission"
 )
+
+# Validate mutually exclusive parameters
+if ($ReverseLookup -and $DiscoverMailboxes)
+{
+    Write-Error "-ReverseLookup and -DiscoverMailboxes cannot be used together. Use -DiscoverMailboxes for migration scenarios."
+    exit 1
+}
+
+if ($PrepareForMigration -and $ReverseLookup)
+{
+    Write-Error "-PrepareForMigration cannot be used with -ReverseLookup. Use -DiscoverMailboxes -PrepareForMigration instead."
+    exit 1
+}
+
+if ($DiscoverMailboxes -and -not $InputCsvPath)
+{
+    Write-Error "-DiscoverMailboxes requires -InputCsvPath with user UPN list"
+    exit 1
+}
 
 
 # Function to resolve GUID to user identity
@@ -127,8 +148,12 @@ function Resolve-UserIdentity {
 }
 
 # Generate output file path
-$ReportType = if ($ReverseLookup) { "MailboxesWithSpecifiedDelegates" } else { "MailboxDelegationReport" }
+$ReportType = if ($ReverseLookup) { "MailboxesWithSpecifiedDelegates" } elseif ($DiscoverMailboxes) { "DiscoveredMailboxDelegationReport" } else { "MailboxDelegationReport" }
 $OutputFile = Join-Path $OutputPath "${ReportType}_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+
+# Initialize variables for PrepareForMigration
+$migrationIssues = @()
+$filterToUsers = $null
 
 # Determine mailbox types and mode based on parameters
 if ($ReverseLookup)
@@ -141,6 +166,13 @@ if ($ReverseLookup)
     $MailboxTypes = @("SharedMailbox", "RoomMailbox", "EquipmentMailbox") # Always get all shared/room/equipment for reverse lookup
     Write-Output "Starting Reverse Lookup Report..."
     Write-Output "Finding mailboxes that users from CSV have permissions on: $InputCsvPath"
+}
+elseif ($DiscoverMailboxes)
+{
+    # Discovery mode: Find mailboxes that specified users have access to
+    Write-Output "Starting Mailbox Discovery Mode..."
+    Write-Output "This will find mailboxes accessible to users in: $InputCsvPath"
+    $MailboxTypes = @() # Will be determined by discovery
 }
 elseif ($InputCsvPath)
 {
@@ -281,6 +313,152 @@ try
         $targetDynamicDistributionGroups = @(Get-DynamicDistributionGroup -ResultSize Unlimited)
         $ddgText = if ($targetDynamicDistributionGroups.Count -eq 1) { "dynamic distribution group" } else { "dynamic distribution groups" }
         Write-Output "Retrieved $($targetDynamicDistributionGroups.Count) $ddgText"
+    }
+    elseif ($DiscoverMailboxes)
+    {
+        # Discovery mode: Two-phase process
+        # Phase 1: Find all mailboxes that specified users have permissions on
+        # Phase 2: For discovered mailboxes, get ALL permissions but filter to specified users only
+
+        Write-Output "Phase 1: Reading user list from CSV..."
+        $csvData = Import-Csv $InputCsvPath
+
+        if (-not $csvData -or $csvData.Count -eq 0)
+        {
+            Write-Error "CSV file is empty or could not be read: $InputCsvPath"
+            exit 1
+        }
+
+        if (-not ($csvData | Get-Member -Name "upn" -MemberType NoteProperty))
+        {
+            Write-Error "CSV file must contain a 'upn' column with user principal names."
+            exit 1
+        }
+
+        $inputUserUPNs = $csvData | Select-Object -ExpandProperty upn
+        Write-Output "Loaded $($inputUserUPNs.Count) users from input CSV"
+        $filterToUsers = $inputUserUPNs  # Store for filtering later
+
+        Write-Output "Phase 1: Discovering mailboxes accessible to specified users..."
+        Write-Output "This may take a while depending on mailbox count..."
+
+        # Get all mailboxes to check
+        $allMailboxes = Get-Mailbox -ResultSize Unlimited
+        Write-Output "Checking $($allMailboxes.Count) mailboxes for permissions..."
+
+        $discoveredMailboxes = @{}
+        $mbCheckCounter = 0
+
+        foreach ($mailbox in $allMailboxes)
+        {
+            $mbCheckCounter++
+            if ($mbCheckCounter % 100 -eq 0)
+            {
+                Write-Progress -Activity "Discovering Mailboxes (Phase 1)" -Status "Checked $mbCheckCounter of $($allMailboxes.Count) mailboxes" -PercentComplete (($mbCheckCounter / $allMailboxes.Count) * 100)
+            }
+
+            $hasPermission = $false
+
+            # Check FullAccess permissions
+            try
+            {
+                $fullAccessPerms = Get-MailboxPermission $mailbox.Identity -ErrorAction SilentlyContinue |
+                    Where-Object { $_.AccessRights -eq 'FullAccess' -and $_.User -ne 'NT AUTHORITY\SELF' -and $_.IsInherited -eq $false }
+
+                if ($fullAccessPerms)
+                {
+                    foreach ($perm in $fullAccessPerms)
+                    {
+                        if ($perm.User -in $inputUserUPNs)
+                        {
+                            $hasPermission = $true
+                            break
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                Write-Verbose "Could not check FullAccess permissions for $($mailbox.DisplayName): $($_.Exception.Message)"
+            }
+
+            # Check SendAs permissions if not already found
+            if (-not $hasPermission)
+            {
+                try
+                {
+                    if ($SendAsMethod -eq "MailboxPermission")
+                    {
+                        $sendAsPerms = Get-MailboxPermission $mailbox.Identity -ErrorAction SilentlyContinue |
+                            Where-Object { $_.AccessRights -eq 'SendAs' -and $_.Trustee -ne 'NT AUTHORITY\SELF' -and $_.IsInherited -eq $false }
+                    }
+                    else
+                    {
+                        $sendAsPerms = Get-RecipientPermission $mailbox.Identity -ErrorAction SilentlyContinue |
+                            Where-Object { $_.AccessRights -eq 'SendAs' -and $_.Trustee -ne 'NT AUTHORITY\SELF' -and $_.IsInherited -eq $false }
+                    }
+
+                    if ($sendAsPerms)
+                    {
+                        foreach ($perm in $sendAsPerms)
+                        {
+                            if ($perm.Trustee -in $inputUserUPNs)
+                            {
+                                $hasPermission = $true
+                                break
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    Write-Verbose "Could not check SendAs permissions for $($mailbox.DisplayName): $($_.Exception.Message)"
+                }
+            }
+
+            # Check SendOnBehalf permissions if not already found
+            if (-not $hasPermission)
+            {
+                if ($mailbox.GrantSendOnBehalfTo)
+                {
+                    foreach ($delegate in $mailbox.GrantSendOnBehalfTo)
+                    {
+                        # Resolve the delegate identity to compare
+                        $resolvedDelegate = Resolve-UserIdentity -Identity $delegate -IdentityCache $script:IdentityCache
+                        if ($resolvedDelegate -in $inputUserUPNs)
+                        {
+                            $hasPermission = $true
+                            break
+                        }
+                    }
+                }
+            }
+
+            # If any of the input users have permission, add to discovered list
+            if ($hasPermission)
+            {
+                $discoveredMailboxes[$mailbox.Identity] = $mailbox
+            }
+        }
+
+        Write-Progress -Activity "Discovering Mailboxes (Phase 1)" -Completed
+
+        $targetMailboxes = @($discoveredMailboxes.Values)
+        Write-Output "Phase 1 Complete: Discovered $($targetMailboxes.Count) mailboxes accessible to specified users"
+
+        if ($targetMailboxes.Count -eq 0)
+        {
+            Write-Warning "No mailboxes found with permissions for the specified users."
+            Write-Output "This could mean:"
+            Write-Output "  - Users have no mailbox delegation permissions"
+            Write-Output "  - User UPNs in CSV don't match Exchange identities"
+            Write-Output "  - Users only have permissions on distribution groups (not supported in discovery mode)"
+        }
+        else
+        {
+            Write-Output "Phase 2: Generating filtered delegation report for discovered mailboxes..."
+            Write-Output "Report will include only permissions for the $($inputUserUPNs.Count) specified users"
+        }
     }
     elseif ($InputCsvPath -and (Test-Path $InputCsvPath))
     {
@@ -427,6 +605,111 @@ try
             $forwardingRules = @()
             $manager = ""
             $adUser = $null
+
+            # PrepareForMigration: Collect metadata for migration analysis
+            $migrationMetadata = $null
+            if ($PrepareForMigration)
+            {
+                # Get ALL delegates for this mailbox (unfiltered) to calculate totals
+                $allFullAccessDelegates = Get-MailboxPermission $mailbox.Identity -ErrorAction SilentlyContinue |
+                    Where-Object { $_.AccessRights -eq 'FullAccess' -and $_.User -ne 'NT AUTHORITY\SELF' -and $_.IsInherited -eq $false }
+
+                $allSendAsDelegates = @()
+                if ($SendAsMethod -eq "MailboxPermission")
+                {
+                    $allSendAsDelegates = Get-MailboxPermission $mailbox.Identity -ErrorAction SilentlyContinue |
+                        Where-Object { $_.AccessRights -eq 'SendAs' -and $_.Trustee -ne 'NT AUTHORITY\SELF' -and $_.IsInherited -eq $false }
+                }
+                else
+                {
+                    $allSendAsDelegates = Get-RecipientPermission $mailbox.Identity -ErrorAction SilentlyContinue |
+                        Where-Object { $_.AccessRights -eq 'SendAs' -and $_.Trustee -ne 'NT AUTHORITY\SELF' -and $_.IsInherited -eq $false }
+                }
+
+                $allSendOnBehalfDelegates = @()
+                if ($mailbox.GrantSendOnBehalfTo)
+                {
+                    $allSendOnBehalfDelegates = $mailbox.GrantSendOnBehalfTo
+                }
+
+                # Calculate total delegate count
+                $totalDelegateCount = @($allFullAccessDelegates).Count + @($allSendAsDelegates).Count + @($allSendOnBehalfDelegates).Count
+
+                # Calculate migrating vs non-migrating delegates (only if in DiscoverMailboxes mode)
+                $migratingDelegateCount = 0
+                $nonMigratingDelegates = @()
+
+                if ($filterToUsers)
+                {
+                    # Count delegates that are in the filter list
+                    foreach ($delegate in $allFullAccessDelegates)
+                    {
+                        if ($delegate.User -in $filterToUsers)
+                        {
+                            $migratingDelegateCount++
+                        }
+                        else
+                        {
+                            $nonMigratingDelegates += $delegate.User
+                        }
+                    }
+
+                    foreach ($delegate in $allSendAsDelegates)
+                    {
+                        if ($delegate.Trustee -in $filterToUsers)
+                        {
+                            $migratingDelegateCount++
+                        }
+                        else
+                        {
+                            $nonMigratingDelegates += $delegate.Trustee
+                        }
+                    }
+
+                    foreach ($delegate in $allSendOnBehalfDelegates)
+                    {
+                        $resolvedDelegate = Resolve-UserIdentity -Identity $delegate -IdentityCache $script:IdentityCache
+                        if ($resolvedDelegate -in $filterToUsers)
+                        {
+                            $migratingDelegateCount++
+                        }
+                        else
+                        {
+                            $nonMigratingDelegates += $resolvedDelegate
+                        }
+                    }
+                }
+
+                # Get primary owner/manager
+                $primaryOwner = ""
+                if ($mailbox.ManagedBy)
+                {
+                    $primaryOwner = $mailbox.ManagedBy -join "; "
+                }
+
+                # Get delivery restrictions
+                $acceptMessagesOnlyFrom = ""
+                if ($mailbox.AcceptMessagesOnlyFrom)
+                {
+                    $acceptMessagesOnlyFrom = $mailbox.AcceptMessagesOnlyFrom -join "; "
+                }
+
+                $rejectMessagesFrom = ""
+                if ($mailbox.RejectMessagesFrom)
+                {
+                    $rejectMessagesFrom = $mailbox.RejectMessagesFrom -join "; "
+                }
+
+                # Store metadata
+                $migrationMetadata = [PSCustomObject]@{
+                    TotalDelegateCount = $totalDelegateCount
+                    MigratingDelegateCount = if ($filterToUsers) { $migratingDelegateCount } else { "" }
+                    NonMigratingDelegates = if ($filterToUsers) { ($nonMigratingDelegates | Select-Object -Unique) -join "; " } else { "" }
+                    PrimaryOwner = $primaryOwner
+                    AcceptMessagesOnlyFrom = $acceptMessagesOnlyFrom
+                    RejectMessagesFrom = $rejectMessagesFrom
+                }
+            }
 
             # Get AD user information (only if organizational data requested)
             $adUser = $null
@@ -626,7 +909,13 @@ try
                     # Process Full Access delegates
                     foreach ($delegate in $fullAccessDelegates)
                     {
-                        $results += [PSCustomObject]@{
+                        # Filter if in DiscoverMailboxes mode
+                        if ($filterToUsers -and $delegate.User -notin $filterToUsers)
+                        {
+                            continue  # Skip this delegate
+                        }
+
+                        $resultObject = [PSCustomObject]@{
                             MailboxName = $mailbox.DisplayName
                             MailboxUPN = $mailbox.UserPrincipalName
                             MailboxType = $mailbox.RecipientTypeDetails
@@ -645,6 +934,19 @@ try
                             RuleName = ""
                             RuleCondition = ""
                         }
+
+                        # Add migration metadata if PrepareForMigration is enabled
+                        if ($PrepareForMigration -and $migrationMetadata)
+                        {
+                            Add-Member -InputObject $resultObject -NotePropertyName "TotalDelegateCount" -NotePropertyValue $migrationMetadata.TotalDelegateCount
+                            Add-Member -InputObject $resultObject -NotePropertyName "MigratingDelegateCount" -NotePropertyValue $migrationMetadata.MigratingDelegateCount
+                            Add-Member -InputObject $resultObject -NotePropertyName "NonMigratingDelegates" -NotePropertyValue $migrationMetadata.NonMigratingDelegates
+                            Add-Member -InputObject $resultObject -NotePropertyName "PrimaryOwner" -NotePropertyValue $migrationMetadata.PrimaryOwner
+                            Add-Member -InputObject $resultObject -NotePropertyName "AcceptMessagesOnlyFrom" -NotePropertyValue $migrationMetadata.AcceptMessagesOnlyFrom
+                            Add-Member -InputObject $resultObject -NotePropertyName "RejectMessagesFrom" -NotePropertyValue $migrationMetadata.RejectMessagesFrom
+                        }
+
+                        $results += $resultObject
                     }
 
                 # Process Send As delegates
@@ -653,7 +955,13 @@ try
                     # Both Get-MailboxPermission and Get-RecipientPermission use Trustee property for Send As permissions
                     $delegateName = $delegate.Trustee
 
-                    $results += [PSCustomObject]@{
+                    # Filter if in DiscoverMailboxes mode
+                    if ($filterToUsers -and $delegateName -notin $filterToUsers)
+                    {
+                        continue  # Skip this delegate
+                    }
+
+                    $resultObject = [PSCustomObject]@{
                         MailboxName = $mailbox.DisplayName
                         MailboxUPN = $mailbox.UserPrincipalName
                         MailboxType = $mailbox.RecipientTypeDetails
@@ -672,12 +980,31 @@ try
                         RuleName = ""
                         RuleCondition = ""
                     }
+                    if ($PrepareForMigration -and $migrationMetadata)
+                    {
+                        Add-Member -InputObject $resultObject -NotePropertyName "TotalDelegateCount" -NotePropertyValue $migrationMetadata.TotalDelegateCount
+                        Add-Member -InputObject $resultObject -NotePropertyName "MigratingDelegateCount" -NotePropertyValue $migrationMetadata.MigratingDelegateCount
+                        Add-Member -InputObject $resultObject -NotePropertyName "NonMigratingDelegates" -NotePropertyValue $migrationMetadata.NonMigratingDelegates
+                        Add-Member -InputObject $resultObject -NotePropertyName "PrimaryOwner" -NotePropertyValue $migrationMetadata.PrimaryOwner
+                        Add-Member -InputObject $resultObject -NotePropertyName "AcceptMessagesOnlyFrom" -NotePropertyValue $migrationMetadata.AcceptMessagesOnlyFrom
+                        Add-Member -InputObject $resultObject -NotePropertyName "RejectMessagesFrom" -NotePropertyValue $migrationMetadata.RejectMessagesFrom
+                    }
+                    $results += $resultObject
                 }
 
                 # Process Send On Behalf delegates
                 foreach ($delegate in $sendOnBehalfDelegates)
                 {
-                    $results += [PSCustomObject]@{
+                    # Resolve delegate identity for comparison
+                    $resolvedDelegate = Resolve-UserIdentity -Identity $delegate -IdentityCache $script:IdentityCache
+
+                    # Filter if in DiscoverMailboxes mode
+                    if ($filterToUsers -and $resolvedDelegate -notin $filterToUsers)
+                    {
+                        continue  # Skip this delegate
+                    }
+
+                    $resultObject = [PSCustomObject]@{
                         MailboxName = $mailbox.DisplayName
                         MailboxUPN = $mailbox.UserPrincipalName
                         MailboxType = $mailbox.RecipientTypeDetails
@@ -696,6 +1023,16 @@ try
                         RuleName = ""
                         RuleCondition = ""
                     }
+                    if ($PrepareForMigration -and $migrationMetadata)
+                    {
+                        Add-Member -InputObject $resultObject -NotePropertyName "TotalDelegateCount" -NotePropertyValue $migrationMetadata.TotalDelegateCount
+                        Add-Member -InputObject $resultObject -NotePropertyName "MigratingDelegateCount" -NotePropertyValue $migrationMetadata.MigratingDelegateCount
+                        Add-Member -InputObject $resultObject -NotePropertyName "NonMigratingDelegates" -NotePropertyValue $migrationMetadata.NonMigratingDelegates
+                        Add-Member -InputObject $resultObject -NotePropertyName "PrimaryOwner" -NotePropertyValue $migrationMetadata.PrimaryOwner
+                        Add-Member -InputObject $resultObject -NotePropertyName "AcceptMessagesOnlyFrom" -NotePropertyValue $migrationMetadata.AcceptMessagesOnlyFrom
+                        Add-Member -InputObject $resultObject -NotePropertyName "RejectMessagesFrom" -NotePropertyValue $migrationMetadata.RejectMessagesFrom
+                    }
+                    $results += $resultObject
                 }
 
                 # Process forwarding rules
@@ -720,7 +1057,7 @@ try
                         $forwardingDest = ($rule.RedirectTo -join ", ")
                     }
 
-                    $results += [PSCustomObject]@{
+                    $resultObject = [PSCustomObject]@{
                         MailboxName = $mailbox.DisplayName
                         MailboxUPN = $mailbox.UserPrincipalName
                         MailboxType = $mailbox.RecipientTypeDetails
@@ -739,13 +1076,23 @@ try
                         RuleName = $rule.Name
                         RuleCondition = $rule.Description
                     }
+                    if ($PrepareForMigration -and $migrationMetadata)
+                    {
+                        Add-Member -InputObject $resultObject -NotePropertyName "TotalDelegateCount" -NotePropertyValue $migrationMetadata.TotalDelegateCount
+                        Add-Member -InputObject $resultObject -NotePropertyName "MigratingDelegateCount" -NotePropertyValue $migrationMetadata.MigratingDelegateCount
+                        Add-Member -InputObject $resultObject -NotePropertyName "NonMigratingDelegates" -NotePropertyValue $migrationMetadata.NonMigratingDelegates
+                        Add-Member -InputObject $resultObject -NotePropertyName "PrimaryOwner" -NotePropertyValue $migrationMetadata.PrimaryOwner
+                        Add-Member -InputObject $resultObject -NotePropertyName "AcceptMessagesOnlyFrom" -NotePropertyValue $migrationMetadata.AcceptMessagesOnlyFrom
+                        Add-Member -InputObject $resultObject -NotePropertyName "RejectMessagesFrom" -NotePropertyValue $migrationMetadata.RejectMessagesFrom
+                    }
+                    $results += $resultObject
                 }
 
                 # If mailbox has native forwarding but no other delegations, add entry
                 if (($mailbox.ForwardingAddress -or $mailbox.ForwardingSmtpAddress) -and
                     -not $fullAccessDelegates -and -not $sendAsDelegates -and -not $sendOnBehalfDelegates -and -not $forwardingRules)
                 {
-                    $results += [PSCustomObject]@{
+                    $resultObject = [PSCustomObject]@{
                         MailboxName = $mailbox.DisplayName
                         MailboxUPN = $mailbox.UserPrincipalName
                         MailboxType = $mailbox.RecipientTypeDetails
@@ -764,6 +1111,16 @@ try
                         RuleName = ""
                         RuleCondition = ""
                     }
+                    if ($PrepareForMigration -and $migrationMetadata)
+                    {
+                        Add-Member -InputObject $resultObject -NotePropertyName "TotalDelegateCount" -NotePropertyValue $migrationMetadata.TotalDelegateCount
+                        Add-Member -InputObject $resultObject -NotePropertyName "MigratingDelegateCount" -NotePropertyValue $migrationMetadata.MigratingDelegateCount
+                        Add-Member -InputObject $resultObject -NotePropertyName "NonMigratingDelegates" -NotePropertyValue $migrationMetadata.NonMigratingDelegates
+                        Add-Member -InputObject $resultObject -NotePropertyName "PrimaryOwner" -NotePropertyValue $migrationMetadata.PrimaryOwner
+                        Add-Member -InputObject $resultObject -NotePropertyName "AcceptMessagesOnlyFrom" -NotePropertyValue $migrationMetadata.AcceptMessagesOnlyFrom
+                        Add-Member -InputObject $resultObject -NotePropertyName "RejectMessagesFrom" -NotePropertyValue $migrationMetadata.RejectMessagesFrom
+                    }
+                    $results += $resultObject
                 }
             }
         }
@@ -1036,6 +1393,169 @@ try
         }
 
         Write-Progress -Activity "Processing Dynamic Distribution Groups" -Completed
+    }
+
+    # PrepareForMigration: Run validation checks and generate issues CSV
+    if ($PrepareForMigration -and $results.Count -gt 0)
+    {
+        Write-Output "Running migration validation checks..."
+
+        # Group results by mailbox for analysis
+        $mailboxGroups = $results | Group-Object MailboxUPN
+
+        foreach ($mbGroup in $mailboxGroups)
+        {
+            $firstResult = $mbGroup.Group[0]
+            $mailboxName = $firstResult.MailboxName
+            $mailboxUPN = $firstResult.MailboxUPN
+            $mailboxType = $firstResult.MailboxType
+
+            # Get migration metadata from first result (all rows for same mailbox have same metadata)
+            $totalDelegates = if ($firstResult.TotalDelegateCount) { $firstResult.TotalDelegateCount } else { 0 }
+            $migratingDelegates = if ($firstResult.MigratingDelegateCount -and $firstResult.MigratingDelegateCount -ne "") { $firstResult.MigratingDelegateCount } else { 0 }
+            $nonMigratingDelegates = if ($firstResult.NonMigratingDelegates) { $firstResult.NonMigratingDelegates } else { "" }
+            $primaryOwner = if ($firstResult.PrimaryOwner) { $firstResult.PrimaryOwner } else { "" }
+            $acceptMessagesOnlyFrom = if ($firstResult.AcceptMessagesOnlyFrom) { $firstResult.AcceptMessagesOnlyFrom } else { "" }
+            $forwardingSmtpAddress = if ($firstResult.ForwardingSmtpAddress) { $firstResult.ForwardingSmtpAddress } else { "" }
+
+            # Check 1: Incomplete Delegation
+            if ($filterToUsers -and $nonMigratingDelegates -ne "" -and $migratingDelegates -lt $totalDelegates)
+            {
+                $migrationIssues += [PSCustomObject]@{
+                    IssueType = "IncompleteDelegation"
+                    Severity = "Warning"
+                    MailboxName = $mailboxName
+                    MailboxUPN = $mailboxUPN
+                    ImpactedUser = ""
+                    Details = "$totalDelegates total delegates, only $migratingDelegates migrating"
+                    Recommendation = "Review if mailbox will function properly. Non-migrating: $nonMigratingDelegates"
+                    RequiresAction = "No"
+                }
+            }
+
+            # Check 2: Missing Primary Owner
+            if ($primaryOwner -and $filterToUsers -and $primaryOwner -notin $filterToUsers)
+            {
+                $migrationIssues += [PSCustomObject]@{
+                    IssueType = "MissingPrimaryOwner"
+                    Severity = "High"
+                    MailboxName = $mailboxName
+                    MailboxUPN = $mailboxUPN
+                    ImpactedUser = $primaryOwner
+                    Details = "Primary owner not in migration list"
+                    Recommendation = "Assign new owner in target tenant or add to migration"
+                    RequiresAction = "Yes"
+                }
+            }
+
+            # Check 3: Orphaned Mailbox (no FullAccess from migrating users)
+            $hasFullAccess = $mbGroup.Group | Where-Object { $_.PermissionType -eq 'FullAccess' }
+            if ($filterToUsers -and -not $hasFullAccess)
+            {
+                $migrationIssues += [PSCustomObject]@{
+                    IssueType = "OrphanedMailbox"
+                    Severity = "High"
+                    MailboxName = $mailboxName
+                    MailboxUPN = $mailboxUPN
+                    ImpactedUser = ""
+                    Details = "No migrating users have FullAccess"
+                    Recommendation = "Verify if mailbox should migrate or assign FullAccess to migrating user"
+                    RequiresAction = "Yes"
+                }
+            }
+
+            # Check 4: Delivery Restriction Conflicts
+            if ($acceptMessagesOnlyFrom -and $filterToUsers)
+            {
+                $restrictedSenders = $acceptMessagesOnlyFrom -split "; "
+                $nonMigratingSenders = $restrictedSenders | Where-Object { $_ -notin $filterToUsers }
+                if ($nonMigratingSenders)
+                {
+                    $migrationIssues += [PSCustomObject]@{
+                        IssueType = "DeliveryRestrictionConflict"
+                        Severity = "Medium"
+                        MailboxName = $mailboxName
+                        MailboxUPN = $mailboxUPN
+                        ImpactedUser = $nonMigratingSenders -join "; "
+                        Details = "Mailbox accepts messages only from specific senders, some not migrating"
+                        Recommendation = "Update AcceptMessagesOnlyFrom in target tenant"
+                        RequiresAction = "Yes"
+                    }
+                }
+            }
+
+            # Check 5: Cross-Tenant Forwarding
+            if ($forwardingSmtpAddress)
+            {
+                $migrationIssues += [PSCustomObject]@{
+                    IssueType = "CrossTenantForwarding"
+                    Severity = "Medium"
+                    MailboxName = $mailboxName
+                    MailboxUPN = $mailboxUPN
+                    ImpactedUser = ""
+                    Details = "Forwards to $forwardingSmtpAddress (may be in old tenant)"
+                    Recommendation = "Update forwarding address post-migration if needed"
+                    RequiresAction = "Yes"
+                }
+            }
+
+            # Check 6: Distribution Groups
+            if ($mailboxType -in @("DistributionGroup", "DynamicDistributionGroup"))
+            {
+                $migrationIssues += [PSCustomObject]@{
+                    IssueType = "DistributionGroupPermissions"
+                    Severity = "Info"
+                    MailboxName = $mailboxName
+                    MailboxUPN = $mailboxUPN
+                    ImpactedUser = ""
+                    Details = "Distribution groups require separate migration process"
+                    Recommendation = "Use distribution group migration tools"
+                    RequiresAction = "No"
+                }
+            }
+        }
+
+        # Generate Migration Issues CSV if issues found
+        if ($migrationIssues.Count -gt 0)
+        {
+            $issuesFile = Join-Path $OutputPath "MigrationIssues_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+            $migrationIssues | Sort-Object Severity, MailboxName | Export-Csv $issuesFile -NoTypeInformation
+            Write-Output "Migration issues CSV saved to: $issuesFile"
+        }
+
+        # Output console summary
+        Write-Output ""
+        Write-Output "========================================"
+        Write-Output "Migration Preparation Summary"
+        Write-Output "========================================"
+        if ($filterToUsers)
+        {
+            Write-Output "Users in migration list: $($filterToUsers.Count)"
+            Write-Output "Mailboxes discovered: $($mailboxGroups.Count)"
+        }
+        else
+        {
+            Write-Output "Total mailboxes: $($mailboxGroups.Count)"
+        }
+        Write-Output "Total permission entries: $($results.Count)"
+        Write-Output ""
+        if ($migrationIssues.Count -gt 0)
+        {
+            Write-Output "Issues Found:"
+            $issuesBySeverity = $migrationIssues | Group-Object Severity
+            foreach ($severityGroup in $issuesBySeverity | Sort-Object Name)
+            {
+                Write-Output "  $($severityGroup.Name): $($severityGroup.Count)"
+            }
+            Write-Output ""
+            Write-Output "Review MigrationIssues CSV: $issuesFile"
+        }
+        else
+        {
+            Write-Output "No migration issues detected"
+        }
+        Write-Output "========================================"
+        Write-Output ""
     }
 
     # Export results to CSV
