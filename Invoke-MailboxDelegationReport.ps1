@@ -343,7 +343,9 @@ try
     Write-Output "Retrieving Full Access permissions for $($targetMailboxes.Count) $mbFullAccessText..."
     $allFullAccessPermissions = @{}
     $permissionCount = 0
+    $fullAccessCounter = 0
     foreach ($mailbox in $targetMailboxes) {
+        $fullAccessCounter++
         try {
             $fullAccessPerms = Get-MailboxPermission $mailbox.PrimarySmtpAddress |
                 Where-Object { $_.AccessRights -eq 'FullAccess' -and $_.User -ne 'NT AUTHORITY\SELF' -and $_.IsInherited -eq $false }
@@ -361,7 +363,7 @@ try
         catch {
             Write-Warning "Could not get Full Access permissions for $($mailbox.DisplayName): $($_.Exception.Message)"
         }
-        Write-Progress -Activity "Caching Full Access Permissions" -Status "Processing $($mailbox.DisplayName)" -PercentComplete (($targetMailboxes.IndexOf($mailbox) / $targetMailboxes.Count) * 100)
+        Write-Progress -Activity "Caching Full Access Permissions" -Status "Processing $($mailbox.DisplayName)" -PercentComplete (($fullAccessCounter / $targetMailboxes.Count) * 100)
     }
     Write-Output "Cached $permissionCount Full Access permissions"
 
@@ -369,7 +371,9 @@ try
     Write-Output "Retrieving Send As permissions for $($targetMailboxes.Count) $mbSendAsText..."
     $allSendAsPermissions = @{}
     $sendAsCount = 0
+    $sendAsCounter = 0
     foreach ($mailbox in $targetMailboxes) {
+        $sendAsCounter++
         try {
             if ($SendAsMethod -eq "MailboxPermission") {
                 $sendAsPerms = Get-MailboxPermission $mailbox.PrimarySmtpAddress |
@@ -394,7 +398,7 @@ try
         catch {
             Write-Warning "Could not get Send As permissions for $($mailbox.DisplayName): $($_.Exception.Message)"
         }
-        Write-Progress -Activity "Caching Send As Permissions" -Status "Processing $($mailbox.DisplayName)" -PercentComplete (($targetMailboxes.IndexOf($mailbox) / $targetMailboxes.Count) * 100)
+        Write-Progress -Activity "Caching Send As Permissions" -Status "Processing $($mailbox.DisplayName)" -PercentComplete (($sendAsCounter / $targetMailboxes.Count) * 100)
     }
     Write-Output "Cached $sendAsCount Send As permissions"
     }

@@ -132,15 +132,41 @@ try
 
     Write-Information "Found $($delegationData.Count) delegation records in CSV" -InformationAction Continue
 
-    # Validate CSV structure
+    # Validate CSV structure - detect if this is standard or reverse lookup format
+    $csvColumns = $delegationData | Get-Member -MemberType NoteProperty | Select-Object -ExpandProperty Name
+
+    # Check for required columns
     $requiredColumns = @("MailboxUPN", "PermissionType")
     foreach ($column in $requiredColumns)
     {
         if (-not ($delegationData | Get-Member -Name $column -MemberType NoteProperty))
         {
             Write-Error "CSV file must contain a '$column' column. This CSV may not be from Invoke-MailboxDelegationReport.ps1"
+            Write-Information "Available columns: $($csvColumns -join ', ')" -InformationAction Continue
             exit 1
         }
+    }
+
+    # Detect CSV format and provide helpful warnings
+    $hasDelegate = $delegationData | Get-Member -Name "Delegate" -MemberType NoteProperty
+    $hasUserUPN = $delegationData | Get-Member -Name "UserUPN" -MemberType NoteProperty
+
+    if ($hasUserUPN -and -not $hasDelegate)
+    {
+        Write-Warning "Detected REVERSE LOOKUP format CSV (has 'UserUPN' column but no 'Delegate' column)."
+        Write-Warning "This script expects STANDARD delegation report format with these columns:"
+        Write-Warning "  - MailboxUPN, MailboxName, MailboxType, PermissionType, Delegate"
+        Write-Warning ""
+        Write-Warning "Your CSV appears to be from: .\Invoke-MailboxDelegationReport.ps1 -ReverseLookup"
+        Write-Warning "But this script needs CSV from: .\Invoke-MailboxDelegationReport.ps1 (without -ReverseLookup)"
+        Write-Warning ""
+        Write-Warning "Continuing anyway, but Delegate column will be missing and permissions cannot be applied."
+    }
+    elseif (-not $hasDelegate)
+    {
+        Write-Warning "CSV is missing 'Delegate' column. Permission application may fail."
+        Write-Warning "Expected CSV format from standard delegation report with columns:"
+        Write-Warning "  - MailboxUPN, MailboxName, MailboxType, PermissionType, Delegate, DelegateAccessRights"
     }
 
     # Check for Exchange Online session
@@ -206,8 +232,10 @@ try
         # Get unique mailboxes that need to be created
         $uniqueMailboxes = $delegationData | Select-Object -Property MailboxUPN, MailboxType -Unique
 
+        $mbCounter = 0
         foreach ($mbInfo in $uniqueMailboxes)
         {
+            $mbCounter++
             $targetMailboxUPN = $mbInfo.MailboxUPN
 
             # Apply domain replacement if specified
@@ -217,7 +245,7 @@ try
                 $targetMailboxUPN = "$localPart@$ReplaceMailboxDomain"
             }
 
-            Write-Progress -Activity "Creating Mailboxes" -Status "Processing $targetMailboxUPN" -PercentComplete (($uniqueMailboxes.IndexOf($mbInfo) / $uniqueMailboxes.Count) * 100)
+            Write-Progress -Activity "Creating Mailboxes" -Status "Processing $targetMailboxUPN" -PercentComplete (($mbCounter / $uniqueMailboxes.Count) * 100)
 
             # Check if mailbox already exists
             try
@@ -241,11 +269,36 @@ try
                 {
                     if ($CreateEXOMailbox)
                     {
-                        Write-Information "Creating Exchange Online mailbox: $targetMailboxUPN" -InformationAction Continue
-                        # Note: Creating a cloud-only mailbox typically requires New-Mailbox with proper licensing
-                        # The exact approach depends on your tenant configuration
-                        Write-Warning "EXO mailbox creation may require additional licensing and user provisioning steps not automated here."
-                        Write-Warning "Mailbox: $targetMailboxUPN (Type: $($mbInfo.MailboxType))"
+                        Write-Information "Creating Exchange Online mailbox: $targetMailboxUPN (Type: $($mbInfo.MailboxType))" -InformationAction Continue
+
+                        # Determine mailbox creation approach based on type
+                        if ($mbInfo.MailboxType -eq "SharedMailbox")
+                        {
+                            # Create shared mailbox - no licensing required
+                            $localPart = $targetMailboxUPN.Split('@')[0]
+                            New-Mailbox -Shared -Name $localPart -PrimarySmtpAddress $targetMailboxUPN
+                            Write-Information "Successfully created shared mailbox: $targetMailboxUPN" -InformationAction Continue
+                        }
+                        elseif ($mbInfo.MailboxType -eq "RoomMailbox")
+                        {
+                            # Create room mailbox
+                            $localPart = $targetMailboxUPN.Split('@')[0]
+                            New-Mailbox -Room -Name $localPart -PrimarySmtpAddress $targetMailboxUPN
+                            Write-Information "Successfully created room mailbox: $targetMailboxUPN" -InformationAction Continue
+                        }
+                        elseif ($mbInfo.MailboxType -eq "EquipmentMailbox")
+                        {
+                            # Create equipment mailbox
+                            $localPart = $targetMailboxUPN.Split('@')[0]
+                            New-Mailbox -Equipment -Name $localPart -PrimarySmtpAddress $targetMailboxUPN
+                            Write-Information "Successfully created equipment mailbox: $targetMailboxUPN" -InformationAction Continue
+                        }
+                        else
+                        {
+                            # For user mailboxes, note that licensing is required
+                            Write-Warning "User mailbox creation requires Azure AD user account with Exchange license: $targetMailboxUPN"
+                            Write-Warning "Mailbox type '$($mbInfo.MailboxType)' creation not automated. Please create manually or use Azure AD provisioning."
+                        }
                     }
                     elseif ($CreateOnPremMailbox)
                     {
