@@ -286,21 +286,21 @@ try
                         {
                             # Create shared mailbox - no licensing required
                             $localPart = $targetMailboxUPN.Split('@')[0]
-                            New-Mailbox -Shared -Name $localPart -PrimarySmtpAddress $targetMailboxUPN
+                            New-Mailbox -Shared -Name $localPart -PrimarySmtpAddress $targetMailboxUPN | Out-Null
                             Write-Information "Successfully created shared mailbox: $targetMailboxUPN" -InformationAction Continue
                         }
                         elseif ($mbInfo.MailboxType -eq "RoomMailbox")
                         {
                             # Create room mailbox
                             $localPart = $targetMailboxUPN.Split('@')[0]
-                            New-Mailbox -Room -Name $localPart -PrimarySmtpAddress $targetMailboxUPN
+                            New-Mailbox -Room -Name $localPart -PrimarySmtpAddress $targetMailboxUPN | Out-Null
                             Write-Information "Successfully created room mailbox: $targetMailboxUPN" -InformationAction Continue
                         }
                         elseif ($mbInfo.MailboxType -eq "EquipmentMailbox")
                         {
                             # Create equipment mailbox
                             $localPart = $targetMailboxUPN.Split('@')[0]
-                            New-Mailbox -Equipment -Name $localPart -PrimarySmtpAddress $targetMailboxUPN
+                            New-Mailbox -Equipment -Name $localPart -PrimarySmtpAddress $targetMailboxUPN | Out-Null
                             Write-Information "Successfully created equipment mailbox: $targetMailboxUPN" -InformationAction Continue
                         }
                         else
@@ -314,7 +314,7 @@ try
                     {
                         Write-Information "Creating on-premises remote mailbox: $targetMailboxUPN" -InformationAction Continue
                         # New-RemoteMailbox creates the mailbox in Exchange Online via hybrid
-                        New-RemoteMailbox -Name $targetMailboxUPN -UserPrincipalName $targetMailboxUPN -RemoteRoutingAddress "$($targetMailboxUPN.Split('@')[0])@$($sessionInfo.TenantId).mail.onmicrosoft.com"
+                        New-RemoteMailbox -Name $targetMailboxUPN -UserPrincipalName $targetMailboxUPN -RemoteRoutingAddress "$($targetMailboxUPN.Split('@')[0])@$($sessionInfo.TenantId).mail.onmicrosoft.com" | Out-Null
                         Write-Information "Successfully created remote mailbox: $targetMailboxUPN" -InformationAction Continue
                     }
                 }
@@ -410,7 +410,7 @@ try
                     {
                         "FullAccess"
                         {
-                            Add-MailboxPermission -Identity $targetMailboxUPN -User $delegateIdentity -AccessRights FullAccess -InheritanceType All -Confirm:$false
+                            Add-MailboxPermission -Identity $targetMailboxUPN -User $delegateIdentity -AccessRights FullAccess -InheritanceType All -Confirm:$false -ErrorAction Stop | Out-Null
                             $success = $true
                         }
 
@@ -419,14 +419,14 @@ try
                             # Try Add-RecipientPermission first (most common for Send As)
                             try
                             {
-                                Add-RecipientPermission -Identity $targetMailboxUPN -Trustee $delegateIdentity -AccessRights SendAs -Confirm:$false
+                                Add-RecipientPermission -Identity $targetMailboxUPN -Trustee $delegateIdentity -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null
                                 $success = $true
                             }
                             catch
                             {
                                 # Fallback to Add-MailboxPermission if RecipientPermission fails
                                 Write-Verbose "Add-RecipientPermission failed, trying Add-MailboxPermission for Send As"
-                                Add-MailboxPermission -Identity $targetMailboxUPN -User $delegateIdentity -AccessRights SendAs -InheritanceType All -Confirm:$false
+                                Add-MailboxPermission -Identity $targetMailboxUPN -User $delegateIdentity -AccessRights SendAs -InheritanceType All -Confirm:$false -ErrorAction Stop | Out-Null
                                 $success = $true
                             }
                         }
@@ -434,14 +434,14 @@ try
                         "SendOnBehalf"
                         {
                             # Send On Behalf is set on the mailbox object itself
-                            $mailbox = Get-Mailbox -Identity $targetMailboxUPN
+                            $mailbox = Get-Mailbox -Identity $targetMailboxUPN -ErrorAction Stop
                             $currentDelegates = @($mailbox.GrantSendOnBehalfTo)
 
                             # Add delegate if not already present
                             if ($currentDelegates -notcontains $delegateIdentity)
                             {
                                 $currentDelegates += $delegateIdentity
-                                Set-Mailbox -Identity $targetMailboxUPN -GrantSendOnBehalfTo $currentDelegates -Confirm:$false
+                                Set-Mailbox -Identity $targetMailboxUPN -GrantSendOnBehalfTo $currentDelegates -Confirm:$false -ErrorAction Stop | Out-Null
                             }
                             $success = $true
                         }
@@ -463,11 +463,11 @@ try
                                     $currentSenders += $delegateIdentity
                                     if ($group.RecipientTypeDetails -eq "DynamicDistributionGroup")
                                     {
-                                        Set-DynamicDistributionGroup -Identity $targetMailboxUPN -AcceptMessagesOnlyFrom $currentSenders -Confirm:$false
+                                        Set-DynamicDistributionGroup -Identity $targetMailboxUPN -AcceptMessagesOnlyFrom $currentSenders -Confirm:$false -ErrorAction Stop | Out-Null
                                     }
                                     else
                                     {
-                                        Set-DistributionGroup -Identity $targetMailboxUPN -AcceptMessagesOnlyFrom $currentSenders -Confirm:$false
+                                        Set-DistributionGroup -Identity $targetMailboxUPN -AcceptMessagesOnlyFrom $currentSenders -Confirm:$false -ErrorAction Stop | Out-Null
                                     }
                                 }
                                 $success = $true
@@ -491,11 +491,11 @@ try
                                     $currentSenders += $delegateIdentity
                                     if ($group.RecipientTypeDetails -eq "DynamicDistributionGroup")
                                     {
-                                        Set-DynamicDistributionGroup -Identity $targetMailboxUPN -AcceptMessagesOnlyFromSendersOrMembers $currentSenders -Confirm:$false
+                                        Set-DynamicDistributionGroup -Identity $targetMailboxUPN -AcceptMessagesOnlyFromSendersOrMembers $currentSenders -Confirm:$false -ErrorAction Stop | Out-Null
                                     }
                                     else
                                     {
-                                        Set-DistributionGroup -Identity $targetMailboxUPN -AcceptMessagesOnlyFromSendersOrMembers $currentSenders -Confirm:$false
+                                        Set-DistributionGroup -Identity $targetMailboxUPN -AcceptMessagesOnlyFromSendersOrMembers $currentSenders -Confirm:$false -ErrorAction Stop | Out-Null
                                     }
                                 }
                                 $success = $true
@@ -519,11 +519,11 @@ try
                                     $currentDelegates += $delegateIdentity
                                     if ($group.RecipientTypeDetails -eq "DynamicDistributionGroup")
                                     {
-                                        Set-DynamicDistributionGroup -Identity $targetMailboxUPN -GrantSendOnBehalfTo $currentDelegates -Confirm:$false
+                                        Set-DynamicDistributionGroup -Identity $targetMailboxUPN -GrantSendOnBehalfTo $currentDelegates -Confirm:$false -ErrorAction Stop | Out-Null
                                     }
                                     else
                                     {
-                                        Set-DistributionGroup -Identity $targetMailboxUPN -GrantSendOnBehalfTo $currentDelegates -Confirm:$false
+                                        Set-DistributionGroup -Identity $targetMailboxUPN -GrantSendOnBehalfTo $currentDelegates -Confirm:$false -ErrorAction Stop | Out-Null
                                     }
                                 }
                                 $success = $true
@@ -547,11 +547,11 @@ try
                                     $currentModerators += $delegateIdentity
                                     if ($group.RecipientTypeDetails -eq "DynamicDistributionGroup")
                                     {
-                                        Set-DynamicDistributionGroup -Identity $targetMailboxUPN -ModeratedBy $currentModerators -Confirm:$false
+                                        Set-DynamicDistributionGroup -Identity $targetMailboxUPN -ModeratedBy $currentModerators -Confirm:$false -ErrorAction Stop | Out-Null
                                     }
                                     else
                                     {
-                                        Set-DistributionGroup -Identity $targetMailboxUPN -ModeratedBy $currentModerators -Confirm:$false
+                                        Set-DistributionGroup -Identity $targetMailboxUPN -ModeratedBy $currentModerators -Confirm:$false -ErrorAction Stop | Out-Null
                                     }
                                 }
                                 $success = $true
