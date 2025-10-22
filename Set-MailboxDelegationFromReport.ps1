@@ -229,23 +229,33 @@ try
     {
         Write-Information "Phase 1: Creating mailboxes..." -InformationAction Continue
 
-        # Get unique mailboxes that need to be created
-        $uniqueMailboxes = $delegationData | Select-Object -Property MailboxUPN, MailboxType -Unique
+        # Get unique mailboxes that need to be created - force to array with @()
+        $uniqueMailboxes = @($delegationData | Select-Object -Property MailboxUPN, MailboxType -Unique)
 
-        $mbCounter = 0
-        foreach ($mbInfo in $uniqueMailboxes)
+        # Validate we have mailboxes to create
+        if ($uniqueMailboxes.Count -eq 0 -or (-not $uniqueMailboxes[0].MailboxUPN))
         {
-            $mbCounter++
-            $targetMailboxUPN = $mbInfo.MailboxUPN
+            Write-Warning "No valid mailboxes found to create. The CSV may not have 'MailboxUPN' or 'MailboxType' columns populated."
+            Write-Warning "Skipping mailbox creation phase. Continuing to permission application..."
+        }
+        else
+        {
+            Write-Information "Found $($uniqueMailboxes.Count) unique mailbox(es) to create" -InformationAction Continue
 
-            # Apply domain replacement if specified
-            if ($ReplaceMailboxDomain)
+            $mbCounter = 0
+            foreach ($mbInfo in $uniqueMailboxes)
             {
-                $localPart = $targetMailboxUPN.Split('@')[0]
-                $targetMailboxUPN = "$localPart@$ReplaceMailboxDomain"
-            }
+                $mbCounter++
+                $targetMailboxUPN = $mbInfo.MailboxUPN
 
-            Write-Progress -Activity "Creating Mailboxes" -Status "Processing $targetMailboxUPN" -PercentComplete (($mbCounter / $uniqueMailboxes.Count) * 100)
+                # Apply domain replacement if specified
+                if ($ReplaceMailboxDomain)
+                {
+                    $localPart = $targetMailboxUPN.Split('@')[0]
+                    $targetMailboxUPN = "$localPart@$ReplaceMailboxDomain"
+                }
+
+                Write-Progress -Activity "Creating Mailboxes" -Status "Processing $targetMailboxUPN" -PercentComplete (($mbCounter / $uniqueMailboxes.Count) * 100)
 
             # Check if mailbox already exists
             try
@@ -312,6 +322,7 @@ try
                 {
                     Write-Warning "Failed to create mailbox $targetMailboxUPN : $($_.Exception.Message)"
                 }
+            }
             }
         }
 
