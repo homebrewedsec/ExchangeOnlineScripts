@@ -592,9 +592,11 @@ try
     $script:IdentityCache = @{}
 
     # Process each mailbox
+    $mailboxCounter = 0
     foreach ($mailbox in $targetMailboxes)
     {
-        Write-Progress -Activity "Processing Mailboxes" -Status "Processing $($mailbox.DisplayName)" -PercentComplete (($results.Count / $targetMailboxes.Count) * 100)
+        $mailboxCounter++
+        Write-Progress -Activity "Processing Mailboxes" -Status "Processing $($mailbox.DisplayName)" -PercentComplete (($mailboxCounter / $targetMailboxes.Count) * 100)
 
         try
         {
