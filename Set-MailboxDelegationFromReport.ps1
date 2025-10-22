@@ -101,9 +101,9 @@ if ($CreateEXOMailbox -and $CreateOnPremMailbox)
     exit 1
 }
 
-# Generate output file path
+# Generate output file paths
 $OutputFile = Join-Path $OutputPath "MailboxDelegationApplied_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-$ErrorFile = Join-Path $OutputPath "MailboxDelegationErrors_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$ValidationFile = Join-Path $OutputPath "DelegationValidation_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 
 Write-Information "Starting Mailbox Delegation Permission Application..." -InformationAction Continue
 
@@ -224,6 +224,164 @@ try
         Write-Information "Created output directory: $OutputPath" -InformationAction Continue
     }
 
+    # Phase 0: Pre-validation - Check mailbox and delegate existence
+    Write-Information "Phase 0: Validating mailboxes and delegates..." -InformationAction Continue
+
+    $validationResults = @()
+    $validatedDelegations = @()
+    $skippedCount = 0
+
+    # Extract unique mailboxes and delegates with domain replacement applied
+    $uniqueTargetMailboxes = @($delegationData | ForEach-Object {
+        $mbx = $_.MailboxUPN
+        if ($ReplaceMailboxDomain)
+        {
+            $localPart = $mbx.Split('@')[0]
+            $mbx = "$localPart@$ReplaceMailboxDomain"
+        }
+        [PSCustomObject]@{
+            OriginalUPN = $_.MailboxUPN
+            TargetUPN = $mbx
+        }
+    } | Select-Object OriginalUPN, TargetUPN -Unique)
+
+    $uniqueDelegates = @($delegationData | Where-Object { $_.Delegate } | ForEach-Object {
+        $del = $_.Delegate
+        if ($ReplaceDelegateDomain -and $del -match '@')
+        {
+            $localPart = $del.Split('@')[0]
+            $del = "$localPart@$ReplaceDelegateDomain"
+        }
+        [PSCustomObject]@{
+            OriginalDelegate = $_.Delegate
+            TargetDelegate = $del
+        }
+    } | Select-Object OriginalDelegate, TargetDelegate -Unique)
+
+    Write-Information "Validating $($uniqueTargetMailboxes.Count) unique mailbox(es) and $($uniqueDelegates.Count) unique delegate(s)..." -InformationAction Continue
+
+    # Build lookup tables for existence
+    $mailboxExists = @{}
+    $delegateExists = @{}
+
+    # Check mailbox existence (unless we're creating them)
+    if (-not ($CreateEXOMailbox -or $CreateOnPremMailbox))
+    {
+        Write-Verbose "Checking mailbox existence in target environment..."
+        foreach ($mbxInfo in $uniqueTargetMailboxes)
+        {
+            try
+            {
+                $mbx = Get-Mailbox -Identity $mbxInfo.TargetUPN -ErrorAction SilentlyContinue
+                $mailboxExists[$mbxInfo.TargetUPN] = ($null -ne $mbx)
+            }
+            catch
+            {
+                $mailboxExists[$mbxInfo.TargetUPN] = $false
+            }
+        }
+    }
+    else
+    {
+        # If creating mailboxes, assume they will exist after Phase 1
+        foreach ($mbxInfo in $uniqueTargetMailboxes)
+        {
+            $mailboxExists[$mbxInfo.TargetUPN] = $true
+        }
+    }
+
+    # Check delegate existence
+    Write-Verbose "Checking delegate existence in target environment..."
+    foreach ($delInfo in $uniqueDelegates)
+    {
+        try
+        {
+            $recipient = Get-Recipient -Identity $delInfo.TargetDelegate -ErrorAction SilentlyContinue
+            $delegateExists[$delInfo.TargetDelegate] = ($null -ne $recipient)
+        }
+        catch
+        {
+            $delegateExists[$delInfo.TargetDelegate] = $false
+        }
+    }
+
+    # Validate each delegation entry
+    foreach ($delegation in $delegationData)
+    {
+        # Apply domain replacement to get target identities
+        $targetMailboxUPN = $delegation.MailboxUPN
+        if ($ReplaceMailboxDomain)
+        {
+            $localPart = $targetMailboxUPN.Split('@')[0]
+            $targetMailboxUPN = "$localPart@$ReplaceMailboxDomain"
+        }
+
+        $targetDelegate = $delegation.Delegate
+        if ($ReplaceDelegateDomain -and $targetDelegate -match '@')
+        {
+            $localPart = $targetDelegate.Split('@')[0]
+            $targetDelegate = "$localPart@$ReplaceDelegateDomain"
+        }
+
+        $validationStatus = "Ready"
+        $skipReason = ""
+
+        # Check mailbox existence
+        if (-not $mailboxExists[$targetMailboxUPN])
+        {
+            $validationStatus = "WillSkip"
+            $skipReason = "Target mailbox does not exist: $targetMailboxUPN"
+        }
+        # Check delegate existence (skip if no delegate specified)
+        elseif ($targetDelegate -and -not $delegateExists[$targetDelegate])
+        {
+            $validationStatus = "WillSkip"
+            $skipReason = "Delegate not found in target environment: $targetDelegate"
+        }
+
+        # Record validation result
+        $validationResults += [PSCustomObject]@{
+            MailboxUPN = $targetMailboxUPN
+            OriginalMailboxUPN = $delegation.MailboxUPN
+            PermissionType = $delegation.PermissionType
+            Delegate = $targetDelegate
+            OriginalDelegate = $delegation.Delegate
+            ValidationStatus = $validationStatus
+            SkipReason = $skipReason
+        }
+
+        # Add to validated list if ready to process
+        if ($validationStatus -eq "Ready")
+        {
+            $validatedDelegations += $delegation
+        }
+        else
+        {
+            $skippedCount++
+        }
+    }
+
+    # Export validation report
+    if ($validationResults.Count -gt 0)
+    {
+        $validationResults | Sort-Object ValidationStatus, MailboxUPN, PermissionType | Export-Csv $ValidationFile -NoTypeInformation
+        Write-Information "Validation report saved to: $ValidationFile" -InformationAction Continue
+    }
+
+    # Display validation summary
+    Write-Information "Validation Summary:" -InformationAction Continue
+    Write-Information "  Total delegation records: $($delegationData.Count)" -InformationAction Continue
+    Write-Information "  Ready to process: $($validatedDelegations.Count)" -InformationAction Continue
+    Write-Information "  Will skip: $skippedCount" -InformationAction Continue
+
+    if ($skippedCount -gt 0)
+    {
+        Write-Warning "$skippedCount delegation(s) will be skipped due to missing mailboxes or delegates. See validation report for details."
+    }
+
+    # Update delegation data to only include validated entries
+    $delegationData = $validatedDelegations
+
     # Phase 1: Create mailboxes if requested
     if ($CreateEXOMailbox -or $CreateOnPremMailbox)
     {
@@ -286,21 +444,21 @@ try
                         {
                             # Create shared mailbox - no licensing required
                             $localPart = $targetMailboxUPN.Split('@')[0]
-                            New-Mailbox -Shared -Name $localPart -PrimarySmtpAddress $targetMailboxUPN | Out-Null
+                            New-Mailbox -Shared -Name $localPart -PrimarySmtpAddress $targetMailboxUPN -Confirm:$false | Out-Null
                             Write-Information "Successfully created shared mailbox: $targetMailboxUPN" -InformationAction Continue
                         }
                         elseif ($mbInfo.MailboxType -eq "RoomMailbox")
                         {
                             # Create room mailbox
                             $localPart = $targetMailboxUPN.Split('@')[0]
-                            New-Mailbox -Room -Name $localPart -PrimarySmtpAddress $targetMailboxUPN | Out-Null
+                            New-Mailbox -Room -Name $localPart -PrimarySmtpAddress $targetMailboxUPN -Confirm:$false | Out-Null
                             Write-Information "Successfully created room mailbox: $targetMailboxUPN" -InformationAction Continue
                         }
                         elseif ($mbInfo.MailboxType -eq "EquipmentMailbox")
                         {
                             # Create equipment mailbox
                             $localPart = $targetMailboxUPN.Split('@')[0]
-                            New-Mailbox -Equipment -Name $localPart -PrimarySmtpAddress $targetMailboxUPN | Out-Null
+                            New-Mailbox -Equipment -Name $localPart -PrimarySmtpAddress $targetMailboxUPN -Confirm:$false | Out-Null
                             Write-Information "Successfully created equipment mailbox: $targetMailboxUPN" -InformationAction Continue
                         }
                         else
@@ -314,7 +472,7 @@ try
                     {
                         Write-Information "Creating on-premises remote mailbox: $targetMailboxUPN" -InformationAction Continue
                         # New-RemoteMailbox creates the mailbox in Exchange Online via hybrid
-                        New-RemoteMailbox -Name $targetMailboxUPN -UserPrincipalName $targetMailboxUPN -RemoteRoutingAddress "$($targetMailboxUPN.Split('@')[0])@$($sessionInfo.TenantId).mail.onmicrosoft.com" | Out-Null
+                        New-RemoteMailbox -Name $targetMailboxUPN -UserPrincipalName $targetMailboxUPN -RemoteRoutingAddress "$($targetMailboxUPN.Split('@')[0])@$($sessionInfo.TenantId).mail.onmicrosoft.com" -Confirm:$false | Out-Null
                         Write-Information "Successfully created remote mailbox: $targetMailboxUPN" -InformationAction Continue
                     }
                 }
@@ -340,7 +498,6 @@ try
     Write-Information "Phase 2: Applying delegation permissions..." -InformationAction Continue
 
     $results = @()
-    $errors = @()
     $processedCount = 0
 
     foreach ($delegation in $delegationData)
@@ -576,11 +733,20 @@ try
                 $lastError = $_.Exception.Message
                 Write-Verbose "Attempt $attemptCount failed: $lastError"
 
-                # Don't retry if it's a "not found" or "access denied" error
-                if ($lastError -match "couldn't be found|access denied|not found|doesn't exist")
+                # Only retry if target mailbox not found (replication delay after creation)
+                # Don't retry for delegate errors (pre-validated), access denied, or other permanent errors
+                if ($lastError -match "access denied|wasn't found|doesn't exist")
                 {
-                    Write-Warning "Permanent error detected, skipping retries: $lastError"
-                    break
+                    # Check if it's a mailbox replication issue (only retryable error)
+                    if (($CreateEXOMailbox -or $CreateOnPremMailbox) -and $lastError -match "mailbox|recipient.*$targetMailboxUPN")
+                    {
+                        Write-Verbose "Target mailbox replication delay detected, will retry..."
+                    }
+                    else
+                    {
+                        Write-Warning "Permanent error detected, skipping retries: $lastError"
+                        break
+                    }
                 }
             }
         }
@@ -602,18 +768,6 @@ try
         }
         else
         {
-            $errors += [PSCustomObject]@{
-                MailboxUPN = $targetMailboxUPN
-                OriginalMailboxUPN = $delegation.MailboxUPN
-                PermissionType = $delegation.PermissionType
-                Delegate = $delegateIdentity
-                OriginalDelegate = $delegation.Delegate
-                Status = "Failed"
-                Attempts = $attemptCount
-                ErrorMessage = $lastError
-                ProcessedDate = Get-Date
-            }
-
             $results += [PSCustomObject]@{
                 MailboxUPN = $targetMailboxUPN
                 OriginalMailboxUPN = $delegation.MailboxUPN
@@ -638,13 +792,6 @@ try
         Write-Information "Results saved to: $OutputFile" -InformationAction Continue
     }
 
-    if ($errors.Count -gt 0)
-    {
-        Write-Warning "Exporting error report..."
-        $errors | Sort-Object MailboxUPN, PermissionType, Delegate | Export-Csv $ErrorFile -NoTypeInformation
-        Write-Information "Error report saved to: $ErrorFile" -InformationAction Continue
-    }
-
     # Display summary
     Write-Information "Mailbox Delegation Permission Application Summary:" -InformationAction Continue
     Write-Information "  Total Records Processed: $($delegationData.Count)" -InformationAction Continue
@@ -654,8 +801,8 @@ try
     Write-Information "  Mode: $(if ($WhatIfPreference) { 'Simulation' } else { 'Live Application' })" -InformationAction Continue
     if ($ReplaceMailboxDomain) { Write-Information "  Mailbox Domain Replacement: $ReplaceMailboxDomain" -InformationAction Continue }
     if ($ReplaceDelegateDomain) { Write-Information "  Delegate Domain Replacement: $ReplaceDelegateDomain" -InformationAction Continue }
-    Write-Information "  Output: $OutputFile" -InformationAction Continue
-    if ($errors.Count -gt 0) { Write-Information "  Error Report: $ErrorFile" -InformationAction Continue }
+    Write-Information "  Results CSV: $OutputFile" -InformationAction Continue
+    Write-Information "  Validation CSV: $ValidationFile" -InformationAction Continue
 
     Write-Information "Permission Type Summary:" -InformationAction Continue
     $results | Group-Object PermissionType | Select-Object Name, Count | Sort-Object Name | ForEach-Object {
