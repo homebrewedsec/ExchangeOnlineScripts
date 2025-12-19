@@ -298,13 +298,21 @@ try
                         if ($LastLogonDateTime -gt $LookbackTime)
                         {
                             $UserLookup[$User.SamAccountName.ToLower()] = $User
-                            Write-Verbose "    $($User.SamAccountName) logged into $($DC.Name) at $LastLogonDateTime"
+                            Write-Verbose "    $($User.SamAccountName) logged into $($DC.Name) at $LastLogonDateTime - INCLUDED"
                         }
+                        else
+                        {
+                            Write-Verbose "    $($User.SamAccountName) last logon $LastLogonDateTime is before lookback $LookbackTime - SKIPPED"
+                        }
+                    }
+                    else
+                    {
+                        Write-Verbose "    $($User.SamAccountName) has no LastLogon on $($DC.Name) - SKIPPED"
                     }
                 }
                 catch
                 {
-                    Write-Verbose "    Could not query LastLogon for $($User.SamAccountName) on $($DC.Name)"
+                    Write-Verbose "    Could not query LastLogon for $($User.SamAccountName) on $($DC.Name): $($_.Exception.Message)"
                 }
             }
 
@@ -335,6 +343,7 @@ try
                     if ($Events)
                     {
                         Write-Output "      Found $($Events.Count) events"
+                        $filteredCount = 0
                         foreach ($LogEntry in $Events)
                         {
                             # Extract workstation and IP from event XML
@@ -346,6 +355,7 @@ try
                             # Skip events with no workstation
                             if (-not $workstation -or $workstation -eq "-" -or $workstation.Length -eq 0)
                             {
+                                $filteredCount++
                                 continue
                             }
 
@@ -375,6 +385,10 @@ try
                                 Workstation      = $workstation
                                 IpAddress        = $ipAddress
                             }
+                        }
+                        if ($filteredCount -gt 0)
+                        {
+                            Write-Output "      Filtered out $filteredCount events (no workstation)"
                         }
                     }
                 }
