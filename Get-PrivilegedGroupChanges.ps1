@@ -199,13 +199,19 @@ try
     Write-Output "Phase 3: Checking for password changes..."
     $PasswordChanges = @()
     $UserObjects = @()
+    $EnabledUserObjects = @()
 
     foreach ($UserDN in $PrivilegedUsers)
     {
         try
         {
-            $User = Get-ADUser $UserDN -Properties PasswordLastSet, DisplayName, SamAccountName
+            $User = Get-ADUser $UserDN -Properties PasswordLastSet, DisplayName, SamAccountName, Enabled
             $UserObjects += $User
+
+            if ($User.Enabled)
+            {
+                $EnabledUserObjects += $User
+            }
 
             if ($User.PasswordLastSet -gt $LookbackTime)
             {
@@ -213,7 +219,7 @@ try
                     ActivityType    = "PasswordChange"
                     Name            = $User.DisplayName
                     Timestamp       = $User.PasswordLastSet
-                    Details         = "Password changed for $($User.SamAccountName)"
+                    Details         = "Password changed for $($User.SamAccountName) (Enabled: $($User.Enabled))"
                     MemberCount     = $null
                 }
             }
@@ -224,7 +230,9 @@ try
         }
     }
 
+    $disabledCount = $UserObjects.Count - $EnabledUserObjects.Count
     Write-Output "Found $($PasswordChanges.Count) password changes."
+    Write-Output "Found $($EnabledUserObjects.Count) enabled users, $disabledCount disabled (will skip disabled for event logs)."
 
     # Phase 4: Query event logs on domain controllers (unless skipped)
     $PrivilegedLogins = @()
@@ -246,37 +254,55 @@ try
         $dcCount = $DomainControllers.Count
         $dcCurrent = 0
 
+        # Build a hashtable for quick user lookup by SamAccountName (enabled users only)
+        $UserLookup = @{}
+        foreach ($User in $EnabledUserObjects)
+        {
+            $UserLookup[$User.SamAccountName.ToLower()] = $User
+        }
+
         foreach ($DC in $DomainControllers)
         {
             $dcCurrent++
-            Write-Progress -Activity "Querying Domain Controllers" -Status "Checking $($DC.Name)" -PercentComplete (($dcCurrent / $dcCount) * 100)
+            Write-Progress -Activity "Querying Domain Controllers" -Status "Checking $($DC.Name) ($dcCurrent of $dcCount)" -PercentComplete (($dcCurrent / $dcCount) * 100)
 
-            foreach ($User in $UserObjects)
+            try
             {
-                try
+                # Single query per DC - much faster than one query per user
+                $Events = Get-WinEvent -ComputerName $DC.Name -FilterHashtable @{
+                    LogName   = 'Security'
+                    Id        = $EventIDs
+                    StartTime = $LookbackTime
+                } -ErrorAction SilentlyContinue
+
+                if ($Events)
                 {
-                    # Use Get-WinEvent with server-side filtering (much faster than Get-EventLog)
-                    $Events = Get-WinEvent -ComputerName $DC.Name -FilterHashtable @{
-                        LogName   = 'Security'
-                        Id        = $EventIDs
-                        StartTime = $LookbackTime
-                    } -ErrorAction SilentlyContinue | Where-Object { $_.Message -like "*$($User.SamAccountName)*" }
+                    Write-Verbose "  Found $($Events.Count) events on $($DC.Name), filtering for privileged users..."
 
                     foreach ($LogEntry in $Events)
                     {
-                        $PrivilegedLogins += [PSCustomObject]@{
-                            ActivityType    = "LoginEvent"
-                            Name            = $User.DisplayName
-                            Timestamp       = $LogEntry.TimeCreated
-                            Details         = "Event $($LogEntry.Id) on $($DC.Name)"
-                            MemberCount     = $null
+                        # Check if any of our privileged users are in this event
+                        foreach ($SamAccountName in $UserLookup.Keys)
+                        {
+                            if ($LogEntry.Message -like "*$SamAccountName*")
+                            {
+                                $User = $UserLookup[$SamAccountName]
+                                $PrivilegedLogins += [PSCustomObject]@{
+                                    ActivityType    = "LoginEvent"
+                                    Name            = $User.DisplayName
+                                    Timestamp       = $LogEntry.TimeCreated
+                                    Details         = "Event $($LogEntry.Id) on $($DC.Name)"
+                                    MemberCount     = $null
+                                }
+                                break  # Found a match, no need to check other users for this event
+                            }
                         }
                     }
                 }
-                catch
-                {
-                    Write-Verbose "Could not query events on $($DC.Name) for $($User.SamAccountName): $($_.Exception.Message)"
-                }
+            }
+            catch
+            {
+                Write-Verbose "Could not query events on $($DC.Name): $($_.Exception.Message)"
             }
         }
 
