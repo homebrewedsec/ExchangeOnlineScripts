@@ -151,13 +151,16 @@ try
 
     # Phase 2: Check for group membership changes
     Write-Output "Phase 2: Checking for group membership changes..."
+    Write-Output "  Lookback time: $LookbackTime"
     $GroupChanges = @()
     $PrivilegedUsers = @()
 
     foreach ($Group in $Groups)
     {
+        Write-Verbose "  Checking $($Group.Name): WhenChanged=$($Group.WhenChanged)"
         if ($Group.WhenChanged -gt $LookbackTime)
         {
+            Write-Output "  [CHANGE DETECTED] $($Group.Name) - modified $($Group.WhenChanged)"
             $GroupChanges += [PSCustomObject]@{
                 ActivityType    = "GroupChange"
                 Name            = $Group.Name
@@ -252,16 +255,20 @@ try
             {
                 try
                 {
-                    $Events = Get-EventLog -ComputerName $DC.Name -LogName Security -After $LookbackTime -ErrorAction SilentlyContinue |
-                        Where-Object { $_.EventID -in $EventIDs -and $_.Message -like "*$($User.SamAccountName)*" }
+                    # Use Get-WinEvent with server-side filtering (much faster than Get-EventLog)
+                    $Events = Get-WinEvent -ComputerName $DC.Name -FilterHashtable @{
+                        LogName   = 'Security'
+                        Id        = $EventIDs
+                        StartTime = $LookbackTime
+                    } -ErrorAction SilentlyContinue | Where-Object { $_.Message -like "*$($User.SamAccountName)*" }
 
                     foreach ($LogEntry in $Events)
                     {
                         $PrivilegedLogins += [PSCustomObject]@{
                             ActivityType    = "LoginEvent"
                             Name            = $User.DisplayName
-                            Timestamp       = $LogEntry.TimeGenerated
-                            Details         = "Event $($LogEntry.EventID) on $($DC.Name)"
+                            Timestamp       = $LogEntry.TimeCreated
+                            Details         = "Event $($LogEntry.Id) on $($DC.Name)"
                             MemberCount     = $null
                         }
                     }
