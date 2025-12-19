@@ -47,6 +47,10 @@ Optional switch. Skip event log queries on domain controllers for faster executi
 .PARAMETER AlwaysReport
 Optional switch. Generate output even if no changes are detected.
 
+.PARAMETER ExcludeAccounts
+Optional. Array of SamAccountNames to exclude from event log queries.
+Example: -ExcludeAccounts "backupadmin","svc_backup"
+
 .EXAMPLE
 .\Get-PrivilegedGroupChanges.ps1 -SearchBaseOUs "OU=Admins,DC=corp,DC=contoso,DC=com","CN=Builtin,DC=corp,DC=contoso,DC=com" -DomainControllerSearchBase "OU=Domain Controllers,DC=corp,DC=contoso,DC=com"
 
@@ -93,7 +97,9 @@ param(
 
     [switch]$SkipEventLogs,
 
-    [switch]$AlwaysReport
+    [switch]$AlwaysReport,
+
+    [string[]]$ExcludeAccounts
 )
 
 # Validate SMTP parameters if SmtpServer is specified
@@ -275,6 +281,13 @@ try
             $UserLookup = @{}
             foreach ($User in $EnabledDCUsers)
             {
+                # Skip excluded accounts
+                if ($ExcludeAccounts -and $User.SamAccountName -in $ExcludeAccounts)
+                {
+                    Write-Verbose "    Skipping excluded account: $($User.SamAccountName)"
+                    continue
+                }
+
                 try
                 {
                     # Query LastLogon from this specific DC (it's not replicated)
@@ -327,12 +340,11 @@ try
                             # Extract workstation and IP from event XML
                             $eventXml = [xml]$LogEntry.ToXml()
                             $eventData = $eventXml.Event.EventData.Data
-                            $workstation = ($eventData | Where-Object { $_.Name -eq 'WorkstationName' }).'#text'
-                            $ipAddress = ($eventData | Where-Object { $_.Name -eq 'IpAddress' }).'#text'
-                            $logonType = ($eventData | Where-Object { $_.Name -eq 'LogonType' }).'#text'
+                            $workstation = (($eventData | Where-Object { $_.Name -eq 'WorkstationName' }).'#text') -replace '^\s+|\s+$', ''
+                            $ipAddress = (($eventData | Where-Object { $_.Name -eq 'IpAddress' }).'#text') -replace '^\s+|\s+$', ''
 
                             # Skip events with no workstation
-                            if (-not $workstation -or $workstation -eq "-")
+                            if (-not $workstation -or $workstation -eq "-" -or $workstation.Length -eq 0)
                             {
                                 continue
                             }
@@ -355,7 +367,6 @@ try
                             }
 
                             $PrivilegedLogins += [PSCustomObject]@{
-                                ActivityType     = "LoginEvent"
                                 Name             = $User.DisplayName
                                 SamAccountName   = $SamAccountName
                                 EventId          = $LogEntry.Id
@@ -363,7 +374,6 @@ try
                                 DomainController = $DC.Name
                                 Workstation      = $workstation
                                 IpAddress        = $ipAddress
-                                LogonType        = $logonType
                             }
                         }
                     }
@@ -497,6 +507,22 @@ try
                 Select-Object @{N='Workstation';E={$_.Name}}, @{N='TotalEvents';E={$_.Count}} |
                 Sort-Object TotalEvents -Descending
             $Body += $wsSummary | ConvertTo-Html -Fragment
+
+            $Body += "<h3>By Event Type Summary</h3>"
+            $eventSummary = $PrivilegedLogins | Group-Object EventId, EventDescription |
+                Select-Object @{N='EventId';E={$_.Group[0].EventId}},
+                              @{N='Event';E={$_.Group[0].EventDescription}},
+                              @{N='TotalEvents';E={$_.Count}} |
+                Sort-Object TotalEvents -Descending
+            $Body += $eventSummary | ConvertTo-Html -Fragment
+
+            $Body += "<h3>By IP Address Summary</h3>"
+            $ipSummary = $PrivilegedLogins | Where-Object { $_.IpAddress -and $_.IpAddress -ne "-" } |
+                Group-Object IpAddress |
+                Select-Object @{N='IpAddress';E={$_.Name}}, @{N='TotalEvents';E={$_.Count}} |
+                Sort-Object TotalEvents -Descending |
+                Select-Object -First 20
+            $Body += $ipSummary | ConvertTo-Html -Fragment
         }
 
         if ($AllResults.Count -eq 0)
