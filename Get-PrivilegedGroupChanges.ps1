@@ -154,6 +154,10 @@ try
     Write-Output "  Lookback time: $LookbackTime"
     $GroupChanges = @()
     $PrivilegedUsers = @()
+    $DCPrivilegedUsers = @()
+
+    # Groups whose members can log into domain controllers
+    $DCLogonGroups = @("Domain Admins", "Enterprise Admins", "Administrators", "Backup Operators", "Server Operators")
 
     foreach ($Group in $Groups)
     {
@@ -173,6 +177,8 @@ try
         # Collect unique privileged users from all groups
         if ($Group.Members)
         {
+            $isDCLogonGroup = $Group.Name -in $DCLogonGroups
+
             foreach ($MemberDN in $Group.Members)
             {
                 try
@@ -181,6 +187,10 @@ try
                     if ($MemberObj -and $MemberObj.ObjectClass -eq "user")
                     {
                         $PrivilegedUsers += $MemberDN
+                        if ($isDCLogonGroup)
+                        {
+                            $DCPrivilegedUsers += $MemberDN
+                        }
                     }
                 }
                 catch
@@ -193,13 +203,15 @@ try
 
     # Get unique privileged users
     $PrivilegedUsers = $PrivilegedUsers | Select-Object -Unique
+    $DCPrivilegedUsers = $DCPrivilegedUsers | Select-Object -Unique
     Write-Output "Found $($PrivilegedUsers.Count) unique privileged users."
+    Write-Output "Found $($DCPrivilegedUsers.Count) users with DC logon rights (Domain Admins, Enterprise Admins, Administrators, Backup Operators, Server Operators)."
 
     # Phase 3: Get full user objects and check password changes
     Write-Output "Phase 3: Checking for password changes..."
     $PasswordChanges = @()
     $UserObjects = @()
-    $EnabledUserObjects = @()
+    $EnabledDCUsers = @()
 
     foreach ($UserDN in $PrivilegedUsers)
     {
@@ -208,9 +220,10 @@ try
             $User = Get-ADUser $UserDN -Properties PasswordLastSet, DisplayName, SamAccountName, Enabled
             $UserObjects += $User
 
-            if ($User.Enabled)
+            # Only track enabled users who are in DC logon groups for event log queries
+            if ($User.Enabled -and ($UserDN -in $DCPrivilegedUsers))
             {
-                $EnabledUserObjects += $User
+                $EnabledDCUsers += $User
             }
 
             if ($User.PasswordLastSet -gt $LookbackTime)
@@ -230,9 +243,8 @@ try
         }
     }
 
-    $disabledCount = $UserObjects.Count - $EnabledUserObjects.Count
     Write-Output "Found $($PasswordChanges.Count) password changes."
-    Write-Output "Found $($EnabledUserObjects.Count) enabled users, $disabledCount disabled (will skip disabled for event logs)."
+    Write-Output "Found $($EnabledDCUsers.Count) enabled users with DC logon rights (will query event logs for these)."
 
     # Phase 4: Query event logs on domain controllers (unless skipped)
     $PrivilegedLogins = @()
@@ -254,9 +266,9 @@ try
         $dcCount = $DomainControllers.Count
         $dcCurrent = 0
 
-        # Build a hashtable for quick user lookup by SamAccountName (enabled users only)
+        # Build a hashtable for quick user lookup by SamAccountName (enabled DC logon users only)
         $UserLookup = @{}
-        foreach ($User in $EnabledUserObjects)
+        foreach ($User in $EnabledDCUsers)
         {
             $UserLookup[$User.SamAccountName.ToLower()] = $User
         }
