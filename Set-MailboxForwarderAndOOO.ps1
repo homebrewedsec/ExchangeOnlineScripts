@@ -5,15 +5,44 @@ Sets email forwarding and out-of-office messages for users from a CSV file
 .DESCRIPTION
 This script processes a CSV file containing user UPNs and new email addresses to:
 1. Set email forwarding to the specified new email address
-2. Configure out-of-office automatic replies (placeholder implementation)
+2. Configure out-of-office automatic replies with HTML template
 
-The script includes safety features like WhatIf mode and detailed logging.
+The script sends OOO messages to all external senders and includes safety features
+like WhatIf mode and detailed logging.
 
 .PARAMETER InputCsvPath
 Path to the CSV file containing user data. CSV must have 'upn' and 'newemail' columns.
 
 .PARAMETER OutputPath
 Directory path for output logs. Defaults to current directory.
+
+.PARAMETER KeepCopy
+When specified, keeps a copy of forwarded emails in the original mailbox.
+By default, emails are forwarded without keeping a copy.
+
+.PARAMETER OldCompanyName
+The former company name to display in the OOO message. Required.
+
+.PARAMETER NewCompanyName
+The acquiring company name. Required.
+
+.PARAMETER NewBrandName
+The new brand name after acquisition. Required.
+
+.PARAMETER AcquisitionDate
+The date of acquisition to display in OOO message (e.g., "January 2, 2026"). Required.
+
+.PARAMETER ForwardingEndDate
+The date when automatic forwarding will stop (e.g., "April 1st 2026"). Required.
+
+.PARAMETER NewWebsiteUrl
+The new website URL. Required.
+
+.PARAMETER NAStoreUrl
+The North America e-store URL. Required.
+
+.PARAMETER ContactUrl
+The contact page URL. Required.
 
 .PARAMETER WhatIf
 Shows what would be changed without making actual modifications
@@ -25,11 +54,15 @@ Prompts for confirmation before making changes. Use -Confirm:$false to bypass pr
 Provides detailed output during execution
 
 .EXAMPLE
-Set-MailboxForwarderAndOOO.ps1 -InputCsvPath "users.csv" -WhatIf
+Set-MailboxForwarderAndOOO.ps1 -InputCsvPath "users.csv" -OldCompanyName "Acme Corp" -NewCompanyName "Contoso" -NewBrandName "Contoso Acme" -AcquisitionDate "January 2, 2026" -ForwardingEndDate "April 1st 2026" -NewWebsiteUrl "www.contoso-acme.com" -NAStoreUrl "https://store.contoso.com/parts" -ContactUrl "www.contoso-acme.com/contact" -WhatIf
 Tests the script without making changes
 
 .EXAMPLE
-Set-MailboxForwarderAndOOO.ps1 -InputCsvPath "users.csv" -Confirm:$false
+Set-MailboxForwarderAndOOO.ps1 -InputCsvPath "users.csv" -OldCompanyName "Acme Corp" -NewCompanyName "Contoso" -NewBrandName "Contoso Acme" -AcquisitionDate "January 2, 2026" -ForwardingEndDate "April 1st 2026" -NewWebsiteUrl "www.contoso-acme.com" -NAStoreUrl "https://store.contoso.com/parts" -ContactUrl "www.contoso-acme.com/contact" -KeepCopy
+Processes all users, keeping a copy of forwarded emails in the original mailbox
+
+.EXAMPLE
+Set-MailboxForwarderAndOOO.ps1 -InputCsvPath "users.csv" -OldCompanyName "Acme Corp" -NewCompanyName "Contoso" -NewBrandName "Contoso Acme" -AcquisitionDate "January 2, 2026" -ForwardingEndDate "April 1st 2026" -NewWebsiteUrl "www.contoso-acme.com" -NAStoreUrl "https://store.contoso.com/parts" -ContactUrl "www.contoso-acme.com/contact" -Confirm:$false
 Processes all users without confirmation prompts
 
 .NOTES
@@ -44,7 +77,34 @@ param(
     [string]$InputCsvPath,
 
     [Parameter()]
-    [string]$OutputPath = (Get-Location).Path
+    [string]$OutputPath = (Get-Location).Path,
+
+    [Parameter()]
+    [switch]$KeepCopy,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OldCompanyName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$NewCompanyName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$NewBrandName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$AcquisitionDate,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ForwardingEndDate,
+
+    [Parameter(Mandatory = $true)]
+    [string]$NewWebsiteUrl,
+
+    [Parameter(Mandatory = $true)]
+    [string]$NAStoreUrl,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ContactUrl
 )
 
 # Initialize variables
@@ -132,7 +192,7 @@ foreach ($user in $csvData)
         {
             try
             {
-                Set-Mailbox -Identity $upn -ForwardingAddress $null -ForwardingSmtpAddress $newEmail -DeliverToMailboxAndForward $false -ErrorAction Stop
+                Set-Mailbox -Identity $upn -ForwardingAddress $null -ForwardingSmtpAddress $newEmail -DeliverToMailboxAndForward $KeepCopy -ErrorAction Stop
                 $result.ForwardingStatus = "Success"
                 Write-Information "  Forwarding configured successfully" -InformationAction Continue -Tags @('Success')
             }
@@ -147,18 +207,33 @@ foreach ($user in $csvData)
         else
         {
             $result.ForwardingStatus = "WhatIf - Would set forwarding"
-            Write-Information "  [WhatIf] Would set forwarding to: $newEmail" -InformationAction Continue -Tags @('WhatIf')
+            Write-Information "  [WhatIf] Would set forwarding to: $newEmail (KeepCopy: $KeepCopy)" -InformationAction Continue -Tags @('WhatIf')
         }
 
-        # Set out-of-office message (placeholder implementation)
+        # Set out-of-office message with HTML template
         if ($PSCmdlet.ShouldProcess($upn, "Set out-of-office message"))
         {
             try
             {
-                # Placeholder OOO message
-                $oooMessage = "I am no longer with the organization. Please contact me at my new email address: $newEmail"
+                # HTML OOO message template
+                $oooMessage = @"
+<p><strong>Subject:</strong> Announcement: Our Email and Website Addresses Have Changed (Formerly $OldCompanyName)</p>
+<p>Dear Sender,</p>
+<p>As of $AcquisitionDate, $OldCompanyName has been acquired by $NewCompanyName. We are now doing business as $NewBrandName.</p>
+<p>Your email temporarily will be forwarded to our new email addresses. However, to ensure your ability to contact us, we recommend that you update your records:</p>
+<p>My new email address is: <strong>$newEmail</strong></p>
+<ul>
+<li>Our new website address is: $NewWebsiteUrl</li>
+<li>Our new e-store address for spares, consumables, and tools for customers in North America is: $NAStoreUrl</li>
+<li>Our e-store for Europe and Asia is under construction (please contact your local office with queries).</li>
+</ul>
+<p>Contacts for sales &amp; service support can be found at: $ContactUrl</p>
+<p>Your email has been forwarded to the appropriate person/department/party. This email is just a reminder to update your records. The automatic forwarding is only temporary and will stop on $ForwardingEndDate.</p>
+<p>We appreciate your understanding during this transition. We look forward to continuing to serve you under the new $NewBrandName brand.</p>
+<p>Sincerely,<br>$NewBrandName</p>
+"@
 
-                Set-MailboxAutoReplyConfiguration -Identity $upn -AutoReplyState Enabled -InternalMessage $oooMessage -ExternalMessage $oooMessage -ErrorAction Stop
+                Set-MailboxAutoReplyConfiguration -Identity $upn -AutoReplyState Enabled -ExternalAudience All -InternalMessage $oooMessage -ExternalMessage $oooMessage -ErrorAction Stop
                 $result.OOOStatus = "Success"
                 Write-Information "  Out-of-office message configured successfully" -InformationAction Continue -Tags @('Success')
             }
