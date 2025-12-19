@@ -549,12 +549,33 @@ try
 
         try
         {
-            Send-MailMessage -SmtpServer $SmtpServer -From $SmtpFrom -To $SmtpTo -Subject $SmtpSubject -Body $Body -BodyAsHtml -Priority High
-            Write-Output "Email sent successfully to: $($SmtpTo -join ', ')"
+            Write-Output "  SMTP Server: $SmtpServer"
+            Write-Output "  From: $SmtpFrom"
+            Write-Output "  To: $($SmtpTo -join ', ')"
+            Write-Output "  Subject: $SmtpSubject"
+
+            Send-MailMessage -SmtpServer $SmtpServer -From $SmtpFrom -To $SmtpTo -Subject $SmtpSubject -Body $Body -BodyAsHtml -Priority High -ErrorAction Stop
+            Write-Output "Email sent successfully!"
         }
         catch
         {
-            Write-Warning "Failed to send email: $($_.Exception.Message)"
+            $errorMessage = "Failed to send email: $($_.Exception.Message)"
+            Write-Warning $errorMessage
+
+            # Log error to file
+            $errorLogFile = Join-Path $OutputPath "PrivilegedGroupChanges_EmailError_$Timestamp.log"
+            $errorDetails = @"
+Timestamp: $(Get-Date)
+Error: $($_.Exception.Message)
+SMTP Server: $SmtpServer
+From: $SmtpFrom
+To: $($SmtpTo -join ', ')
+Subject: $SmtpSubject
+Full Exception: $($_.Exception | Format-List -Force | Out-String)
+Stack Trace: $($_.ScriptStackTrace)
+"@
+            $errorDetails | Out-File $errorLogFile -Encoding UTF8
+            Write-Output "Error details logged to: $errorLogFile"
         }
     }
 
@@ -613,8 +634,27 @@ try
 }
 catch
 {
-    Write-Error "Script execution failed: $($_.Exception.Message)"
+    $errorMessage = "Script execution failed: $($_.Exception.Message)"
+    Write-Error $errorMessage
     Write-Error "Stack trace: $($_.ScriptStackTrace)"
+
+    # Log error to file
+    $errorLogFile = Join-Path $OutputPath "PrivilegedGroupChanges_Error_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    $errorDetails = @"
+Timestamp: $(Get-Date)
+Error: $($_.Exception.Message)
+Full Exception: $($_.Exception | Format-List -Force | Out-String)
+Stack Trace: $($_.ScriptStackTrace)
+"@
+    try
+    {
+        $errorDetails | Out-File $errorLogFile -Encoding UTF8
+        Write-Output "Error details logged to: $errorLogFile"
+    }
+    catch
+    {
+        Write-Warning "Could not write error log: $($_.Exception.Message)"
+    }
     exit 1
 }
 finally
