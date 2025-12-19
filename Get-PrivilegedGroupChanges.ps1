@@ -310,22 +310,38 @@ try
             foreach ($SamAccountName in $UserLookup.Keys)
             {
                 $User = $UserLookup[$SamAccountName]
+                Write-Output "    Querying $SamAccountName on $($DC.Name)..."
 
                 try
                 {
                     # Use FilterXml for server-side filtering by username - much faster
                     $filterXml = "<QueryList><Query Id='0' Path='Security'><Select Path='Security'>*[System[($eventIdFilter)]] and *[EventData[Data[@Name='TargetUserName']='$SamAccountName']]</Select></Query></QueryList>"
 
-                    $Events = Get-WinEvent -ComputerName $DC.Name -FilterXml $filterXml -ErrorAction SilentlyContinue
+                    $Events = Get-WinEvent -ComputerName $DC.Name -FilterXml $filterXml -MaxEvents 100 -ErrorAction SilentlyContinue
 
-                    foreach ($LogEntry in $Events)
+                    if ($Events)
                     {
-                        $PrivilegedLogins += [PSCustomObject]@{
-                            ActivityType    = "LoginEvent"
-                            Name            = $User.DisplayName
-                            Timestamp       = $LogEntry.TimeCreated
-                            Details         = "Event $($LogEntry.Id) on $($DC.Name)"
-                            MemberCount     = $null
+                        Write-Output "      Found $($Events.Count) events"
+                        foreach ($LogEntry in $Events)
+                        {
+                            # Extract workstation and IP from event XML
+                            $eventXml = [xml]$LogEntry.ToXml()
+                            $eventData = $eventXml.Event.EventData.Data
+                            $workstation = ($eventData | Where-Object { $_.Name -eq 'WorkstationName' }).'#text'
+                            $ipAddress = ($eventData | Where-Object { $_.Name -eq 'IpAddress' }).'#text'
+                            $logonType = ($eventData | Where-Object { $_.Name -eq 'LogonType' }).'#text'
+
+                            $PrivilegedLogins += [PSCustomObject]@{
+                                ActivityType    = "LoginEvent"
+                                Name            = $User.DisplayName
+                                SamAccountName  = $SamAccountName
+                                Timestamp       = $LogEntry.TimeCreated
+                                EventId         = $LogEntry.Id
+                                DomainController = $DC.Name
+                                Workstation     = $workstation
+                                IpAddress       = $ipAddress
+                                LogonType       = $logonType
+                            }
                         }
                     }
                 }
@@ -414,7 +430,7 @@ try
         if ($PrivilegedLogins.Count -gt 0)
         {
             $Body += "<h2>Login Events ($($PrivilegedLogins.Count))</h2>"
-            $Body += $PrivilegedLogins | Select-Object Name, Timestamp, Details -Unique | ConvertTo-Html -Fragment
+            $Body += $PrivilegedLogins | Select-Object Name, SamAccountName, Timestamp, EventId, DomainController, Workstation, IpAddress | ConvertTo-Html -Fragment
         }
 
         if ($AllResults.Count -eq 0)
@@ -445,6 +461,49 @@ try
     Write-Output "Password changes: $($PasswordChanges.Count)"
     Write-Output "Login events: $($PrivilegedLogins.Count)"
     Write-Output "Total activities: $($AllResults.Count)"
+
+    if ($PrivilegedLogins.Count -gt 0)
+    {
+        Write-Output ""
+        Write-Output "=== Login Events by User ==="
+        $PrivilegedLogins | Group-Object SamAccountName | Sort-Object Count -Descending | ForEach-Object {
+            Write-Output "  $($_.Name): $($_.Count) events"
+        }
+
+        Write-Output ""
+        Write-Output "=== Login Events by Event Type ==="
+        $PrivilegedLogins | Group-Object EventId | Sort-Object Count -Descending | ForEach-Object {
+            $eventDesc = switch ($_.Name) {
+                "4624" { "Successful logon" }
+                "4625" { "Failed logon" }
+                "4648" { "Explicit credentials" }
+                "4672" { "Special privileges assigned" }
+                "4634" { "Logoff" }
+                "4647" { "User initiated logoff" }
+                "4778" { "Session reconnected" }
+                "4768" { "Kerberos TGT request" }
+                "4769" { "Kerberos service ticket" }
+                "4770" { "Kerberos ticket renewed" }
+                "4771" { "Kerberos pre-auth failed" }
+                "4774" { "Account mapped for logon" }
+                "4776" { "Credential validation" }
+                default { "Unknown" }
+            }
+            Write-Output "  $($_.Name) ($eventDesc): $($_.Count) events"
+        }
+
+        Write-Output ""
+        Write-Output "=== Login Events by Workstation ==="
+        $PrivilegedLogins | Where-Object { $_.Workstation } | Group-Object Workstation | Sort-Object Count -Descending | Select-Object -First 10 | ForEach-Object {
+            Write-Output "  $($_.Name): $($_.Count) events"
+        }
+
+        Write-Output ""
+        Write-Output "=== Login Events by IP Address ==="
+        $PrivilegedLogins | Where-Object { $_.IpAddress -and $_.IpAddress -ne "-" } | Group-Object IpAddress | Sort-Object Count -Descending | Select-Object -First 10 | ForEach-Object {
+            Write-Output "  $($_.Name): $($_.Count) events"
+        }
+    }
 }
 catch
 {
