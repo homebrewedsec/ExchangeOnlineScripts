@@ -317,7 +317,7 @@ try
                     # Use FilterXml for server-side filtering by username - much faster
                     $filterXml = "<QueryList><Query Id='0' Path='Security'><Select Path='Security'>*[System[($eventIdFilter)]] and *[EventData[Data[@Name='TargetUserName']='$SamAccountName']]</Select></Query></QueryList>"
 
-                    $Events = Get-WinEvent -ComputerName $DC.Name -FilterXml $filterXml -MaxEvents 100 -ErrorAction SilentlyContinue
+                    $Events = Get-WinEvent -ComputerName $DC.Name -FilterXml $filterXml -ErrorAction SilentlyContinue
 
                     if ($Events)
                     {
@@ -331,16 +331,39 @@ try
                             $ipAddress = ($eventData | Where-Object { $_.Name -eq 'IpAddress' }).'#text'
                             $logonType = ($eventData | Where-Object { $_.Name -eq 'LogonType' }).'#text'
 
+                            # Skip events with no workstation
+                            if (-not $workstation -or $workstation -eq "-")
+                            {
+                                continue
+                            }
+
+                            $eventDesc = switch ($LogEntry.Id) {
+                                4624 { "Successful logon" }
+                                4625 { "Failed logon" }
+                                4648 { "Explicit credentials" }
+                                4672 { "Special privileges assigned" }
+                                4634 { "Logoff" }
+                                4647 { "User initiated logoff" }
+                                4778 { "Session reconnected" }
+                                4768 { "Kerberos TGT request" }
+                                4769 { "Kerberos service ticket" }
+                                4770 { "Kerberos ticket renewed" }
+                                4771 { "Kerberos pre-auth failed" }
+                                4774 { "Account mapped for logon" }
+                                4776 { "Credential validation" }
+                                default { "Unknown" }
+                            }
+
                             $PrivilegedLogins += [PSCustomObject]@{
-                                ActivityType    = "LoginEvent"
-                                Name            = $User.DisplayName
-                                SamAccountName  = $SamAccountName
-                                Timestamp       = $LogEntry.TimeCreated
-                                EventId         = $LogEntry.Id
+                                ActivityType     = "LoginEvent"
+                                Name             = $User.DisplayName
+                                SamAccountName   = $SamAccountName
+                                EventId          = $LogEntry.Id
+                                EventDescription = $eventDesc
                                 DomainController = $DC.Name
-                                Workstation     = $workstation
-                                IpAddress       = $ipAddress
-                                LogonType       = $logonType
+                                Workstation      = $workstation
+                                IpAddress        = $ipAddress
+                                LogonType        = $logonType
                             }
                         }
                     }
@@ -379,22 +402,44 @@ try
 
     # Generate CSV output
     $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $OutputFile = Join-Path $OutputPath "PrivilegedGroupActivity_$Timestamp.csv"
 
-    if ($AllResults.Count -gt 0)
+    # Export group and password changes
+    if ($GroupChanges.Count -gt 0 -or $PasswordChanges.Count -gt 0)
     {
-        $AllResults | Sort-Object Timestamp -Descending | Export-Csv $OutputFile -NoTypeInformation
-        Write-Output "CSV report saved to: $OutputFile"
+        $ChangesFile = Join-Path $OutputPath "PrivilegedGroupChanges_$Timestamp.csv"
+        $changes = @()
+        $changes += $GroupChanges
+        $changes += $PasswordChanges
+        $changes | Sort-Object Timestamp -Descending | Export-Csv $ChangesFile -NoTypeInformation
+        Write-Output "Changes report saved to: $ChangesFile"
     }
-    elseif ($AlwaysReport)
+
+    # Export login events (grouped and counted)
+    if ($PrivilegedLogins.Count -gt 0)
     {
-        # Create empty report with headers
+        $LoginsFile = Join-Path $OutputPath "PrivilegedLogins_$Timestamp.csv"
+        $loginSummary = $PrivilegedLogins | Group-Object SamAccountName, Name, Workstation, IpAddress, EventId, EventDescription, DomainController |
+            Select-Object @{N='SamAccountName';E={$_.Group[0].SamAccountName}},
+                          @{N='DisplayName';E={$_.Group[0].Name}},
+                          @{N='Workstation';E={$_.Group[0].Workstation}},
+                          @{N='IpAddress';E={$_.Group[0].IpAddress}},
+                          @{N='EventId';E={$_.Group[0].EventId}},
+                          @{N='EventDescription';E={$_.Group[0].EventDescription}},
+                          @{N='DomainController';E={$_.Group[0].DomainController}},
+                          @{N='Count';E={$_.Count}} |
+            Sort-Object SamAccountName, Workstation, EventId
+        $loginSummary | Export-Csv $LoginsFile -NoTypeInformation
+        Write-Output "Logins report saved to: $LoginsFile"
+    }
+
+    if ($AllResults.Count -eq 0 -and $AlwaysReport)
+    {
+        $OutputFile = Join-Path $OutputPath "PrivilegedGroupActivity_$Timestamp.csv"
         [PSCustomObject]@{
             ActivityType = "NoActivity"
             Name         = "No changes detected"
             Timestamp    = Get-Date
             Details      = "No privileged group activity in the last $LookbackMinutes minutes"
-            MemberCount  = $null
         } | Export-Csv $OutputFile -NoTypeInformation
         Write-Output "Empty report saved to: $OutputFile"
     }
@@ -429,8 +474,29 @@ try
 
         if ($PrivilegedLogins.Count -gt 0)
         {
-            $Body += "<h2>Login Events ($($PrivilegedLogins.Count))</h2>"
-            $Body += $PrivilegedLogins | Select-Object Name, SamAccountName, Timestamp, EventId, DomainController, Workstation, IpAddress | ConvertTo-Html -Fragment
+            $Body += "<h2>Login Events ($($PrivilegedLogins.Count) total)</h2>"
+
+            $Body += "<h3>By User and Workstation</h3>"
+            $loginSummary = $PrivilegedLogins | Group-Object SamAccountName, Workstation, EventId, EventDescription |
+                Select-Object @{N='User';E={$_.Group[0].SamAccountName}},
+                              @{N='Workstation';E={$_.Group[0].Workstation}},
+                              @{N='EventId';E={$_.Group[0].EventId}},
+                              @{N='Event';E={$_.Group[0].EventDescription}},
+                              @{N='Count';E={$_.Count}} |
+                Sort-Object User, Workstation, EventId
+            $Body += $loginSummary | ConvertTo-Html -Fragment
+
+            $Body += "<h3>By User Summary</h3>"
+            $userSummary = $PrivilegedLogins | Group-Object SamAccountName |
+                Select-Object @{N='User';E={$_.Name}}, @{N='TotalEvents';E={$_.Count}} |
+                Sort-Object TotalEvents -Descending
+            $Body += $userSummary | ConvertTo-Html -Fragment
+
+            $Body += "<h3>By Workstation Summary</h3>"
+            $wsSummary = $PrivilegedLogins | Group-Object Workstation |
+                Select-Object @{N='Workstation';E={$_.Name}}, @{N='TotalEvents';E={$_.Count}} |
+                Sort-Object TotalEvents -Descending
+            $Body += $wsSummary | ConvertTo-Html -Fragment
         }
 
         if ($AllResults.Count -eq 0)
