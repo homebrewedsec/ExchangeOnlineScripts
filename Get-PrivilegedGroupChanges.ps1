@@ -304,43 +304,35 @@ try
             $userNames = ($UserLookup.Keys | Sort-Object) -join ", "
             Write-Output "  $($DC.Name): Checking $($UserLookup.Count) user(s): $userNames"
 
-            try
-            {
-                # Single query per DC - much faster than one query per user
-                $Events = Get-WinEvent -ComputerName $DC.Name -FilterHashtable @{
-                    LogName   = 'Security'
-                    Id        = $EventIDs
-                    StartTime = $LookbackTime
-                } -ErrorAction SilentlyContinue
+            # Build EventID filter for XML query
+            $eventIdFilter = ($EventIDs | ForEach-Object { "EventID=$_" }) -join " or "
 
-                if ($Events)
+            foreach ($SamAccountName in $UserLookup.Keys)
+            {
+                $User = $UserLookup[$SamAccountName]
+
+                try
                 {
-                    Write-Verbose "  Found $($Events.Count) events on $($DC.Name), filtering for privileged users..."
+                    # Use FilterXml for server-side filtering by username - much faster
+                    $filterXml = "<QueryList><Query Id='0' Path='Security'><Select Path='Security'>*[System[($eventIdFilter)]] and *[EventData[Data[@Name='TargetUserName']='$SamAccountName']]</Select></Query></QueryList>"
+
+                    $Events = Get-WinEvent -ComputerName $DC.Name -FilterXml $filterXml -ErrorAction SilentlyContinue
 
                     foreach ($LogEntry in $Events)
                     {
-                        # Check if any of our privileged users are in this event
-                        foreach ($SamAccountName in $UserLookup.Keys)
-                        {
-                            if ($LogEntry.Message -like "*$SamAccountName*")
-                            {
-                                $User = $UserLookup[$SamAccountName]
-                                $PrivilegedLogins += [PSCustomObject]@{
-                                    ActivityType    = "LoginEvent"
-                                    Name            = $User.DisplayName
-                                    Timestamp       = $LogEntry.TimeCreated
-                                    Details         = "Event $($LogEntry.Id) on $($DC.Name)"
-                                    MemberCount     = $null
-                                }
-                                break  # Found a match, no need to check other users for this event
-                            }
+                        $PrivilegedLogins += [PSCustomObject]@{
+                            ActivityType    = "LoginEvent"
+                            Name            = $User.DisplayName
+                            Timestamp       = $LogEntry.TimeCreated
+                            Details         = "Event $($LogEntry.Id) on $($DC.Name)"
+                            MemberCount     = $null
                         }
                     }
                 }
-            }
-            catch
-            {
-                Write-Verbose "Could not query events on $($DC.Name): $($_.Exception.Message)"
+                catch
+                {
+                    Write-Verbose "Could not query events for $SamAccountName on $($DC.Name): $($_.Exception.Message)"
+                }
             }
         }
 
