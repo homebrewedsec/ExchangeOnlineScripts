@@ -266,17 +266,43 @@ try
         $dcCount = $DomainControllers.Count
         $dcCurrent = 0
 
-        # Build a hashtable for quick user lookup by SamAccountName (enabled DC logon users only)
-        $UserLookup = @{}
-        foreach ($User in $EnabledDCUsers)
-        {
-            $UserLookup[$User.SamAccountName.ToLower()] = $User
-        }
-
         foreach ($DC in $DomainControllers)
         {
             $dcCurrent++
             Write-Progress -Activity "Querying Domain Controllers" -Status "Checking $($DC.Name) ($dcCurrent of $dcCount)" -PercentComplete (($dcCurrent / $dcCount) * 100)
+
+            # Build user lookup for this DC - only include users who logged in recently (per LastLogon)
+            $UserLookup = @{}
+            foreach ($User in $EnabledDCUsers)
+            {
+                try
+                {
+                    # Query LastLogon from this specific DC (it's not replicated)
+                    $UserOnDC = Get-ADUser $User.SamAccountName -Server $DC.Name -Properties LastLogon -ErrorAction SilentlyContinue
+                    if ($UserOnDC.LastLogon -and $UserOnDC.LastLogon -gt 0)
+                    {
+                        $LastLogonDateTime = [DateTime]::FromFileTime($UserOnDC.LastLogon)
+                        if ($LastLogonDateTime -gt $LookbackTime)
+                        {
+                            $UserLookup[$User.SamAccountName.ToLower()] = $User
+                            Write-Verbose "    $($User.SamAccountName) logged into $($DC.Name) at $LastLogonDateTime"
+                        }
+                    }
+                }
+                catch
+                {
+                    Write-Verbose "    Could not query LastLogon for $($User.SamAccountName) on $($DC.Name)"
+                }
+            }
+
+            if ($UserLookup.Count -eq 0)
+            {
+                Write-Output "  $($DC.Name): No users logged in within lookback period, skipping event log query."
+                continue
+            }
+
+            $userNames = ($UserLookup.Keys | Sort-Object) -join ", "
+            Write-Output "  $($DC.Name): Checking $($UserLookup.Count) user(s): $userNames"
 
             try
             {
