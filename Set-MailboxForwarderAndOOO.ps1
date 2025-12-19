@@ -20,6 +20,10 @@ Directory path for output logs. Defaults to current directory.
 When specified, keeps a copy of forwarded emails in the original mailbox.
 By default, emails are forwarded without keeping a copy.
 
+.PARAMETER DisableOOO
+When specified, disables the out-of-office auto-reply instead of enabling it.
+Use this to turn off OOO for users who previously had it enabled.
+
 .PARAMETER OldCompanyName
 The former company name to display in the OOO message. Required.
 
@@ -71,7 +75,7 @@ Requires active Exchange Online PowerShell session.
 Use Connect-ExchangeOnline before running this script.
 #>
 
-[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High', DefaultParameterSetName = 'EnableOOO')]
 param(
     [Parameter(Mandatory = $true)]
     [string]$InputCsvPath,
@@ -82,28 +86,31 @@ param(
     [Parameter()]
     [switch]$KeepCopy,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(ParameterSetName = 'DisableOOO')]
+    [switch]$DisableOOO,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'EnableOOO')]
     [string]$OldCompanyName,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'EnableOOO')]
     [string]$NewCompanyName,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'EnableOOO')]
     [string]$NewBrandName,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'EnableOOO')]
     [string]$AcquisitionDate,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'EnableOOO')]
     [string]$ForwardingEndDate,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'EnableOOO')]
     [string]$NewWebsiteUrl,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'EnableOOO')]
     [string]$NAStoreUrl,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'EnableOOO')]
     [string]$ContactUrl
 )
 
@@ -210,13 +217,39 @@ foreach ($user in $csvData)
             Write-Information "  [WhatIf] Would set forwarding to: $newEmail (KeepCopy: $KeepCopy)" -InformationAction Continue -Tags @('WhatIf')
         }
 
-        # Set out-of-office message with HTML template
-        if ($PSCmdlet.ShouldProcess($upn, "Set out-of-office message"))
+        # Set or disable out-of-office message
+        if ($DisableOOO)
         {
-            try
+            if ($PSCmdlet.ShouldProcess($upn, "Disable out-of-office message"))
             {
-                # HTML OOO message template
-                $oooMessage = @"
+                try
+                {
+                    Set-MailboxAutoReplyConfiguration -Identity $upn -AutoReplyState Disabled -ErrorAction Stop
+                    $result.OOOStatus = "Disabled"
+                    Write-Information "  Out-of-office disabled successfully" -InformationAction Continue -Tags @('Success')
+                }
+                catch
+                {
+                    $result.OOOStatus = "Failed"
+                    $result.ErrorMessage += "OOO error: $($_.Exception.Message); "
+                    Write-Warning "  Failed to disable out-of-office: $($_.Exception.Message)"
+                    $errorCount++
+                }
+            }
+            else
+            {
+                $result.OOOStatus = "WhatIf - Would disable OOO"
+                Write-Information "  [WhatIf] Would disable OOO message" -InformationAction Continue -Tags @('WhatIf')
+            }
+        }
+        else
+        {
+            if ($PSCmdlet.ShouldProcess($upn, "Set out-of-office message"))
+            {
+                try
+                {
+                    # HTML OOO message template
+                    $oooMessage = @"
 <p><strong>Subject:</strong> Announcement: Our Email and Website Addresses Have Changed (Formerly $OldCompanyName)</p>
 <p>Dear Sender,</p>
 <p>As of $AcquisitionDate, $OldCompanyName has been acquired by $NewCompanyName. We are now doing business as $NewBrandName.</p>
@@ -233,22 +266,23 @@ foreach ($user in $csvData)
 <p>Sincerely,<br>$NewBrandName</p>
 "@
 
-                Set-MailboxAutoReplyConfiguration -Identity $upn -AutoReplyState Enabled -ExternalAudience All -InternalMessage $oooMessage -ExternalMessage $oooMessage -ErrorAction Stop
-                $result.OOOStatus = "Success"
-                Write-Information "  Out-of-office message configured successfully" -InformationAction Continue -Tags @('Success')
+                    Set-MailboxAutoReplyConfiguration -Identity $upn -AutoReplyState Enabled -ExternalAudience All -InternalMessage $oooMessage -ExternalMessage $oooMessage -ErrorAction Stop
+                    $result.OOOStatus = "Success"
+                    Write-Information "  Out-of-office message configured successfully" -InformationAction Continue -Tags @('Success')
+                }
+                catch
+                {
+                    $result.OOOStatus = "Failed"
+                    $result.ErrorMessage += "OOO error: $($_.Exception.Message); "
+                    Write-Warning "  Failed to set out-of-office: $($_.Exception.Message)"
+                    $errorCount++
+                }
             }
-            catch
+            else
             {
-                $result.OOOStatus = "Failed"
-                $result.ErrorMessage += "OOO error: $($_.Exception.Message); "
-                Write-Warning "  Failed to set out-of-office: $($_.Exception.Message)"
-                $errorCount++
+                $result.OOOStatus = "WhatIf - Would set OOO message"
+                Write-Information "  [WhatIf] Would set OOO message" -InformationAction Continue -Tags @('WhatIf')
             }
-        }
-        else
-        {
-            $result.OOOStatus = "WhatIf - Would set OOO message"
-            Write-Information "  [WhatIf] Would set OOO message" -InformationAction Continue -Tags @('WhatIf')
         }
 
         $processedCount++
