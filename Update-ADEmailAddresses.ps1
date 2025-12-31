@@ -194,12 +194,22 @@ foreach ($record in $csvData)
     }
 
     # Check if new email already exists in proxyAddresses
-    $existingProxy = $adUser.proxyAddresses | Where-Object { $_ -like "*$newEmail" }
-    if ($existingProxy)
+    $existingPrimary = $adUser.proxyAddresses | Where-Object { $_ -ceq "SMTP:$newEmail" }
+    $existingSecondary = $adUser.proxyAddresses | Where-Object { $_ -ceq "smtp:$newEmail" }
+
+    if ($existingPrimary)
     {
-        Write-LogEntry "New email $newEmail already exists in proxyAddresses for user $($adUser.SamAccountName). Skipping." "WARNING"
+        Write-LogEntry "New email $newEmail is already the primary SMTP address for user $($adUser.SamAccountName). Skipping." "WARNING"
         $skippedCount++
         continue
+    }
+
+    # Flag to indicate we need to promote existing secondary to primary
+    $promoteExisting = $false
+    if ($existingSecondary)
+    {
+        Write-LogEntry "New email $newEmail exists as secondary address for user $($adUser.SamAccountName). Will promote to primary."
+        $promoteExisting = $true
     }
 
     # Prepare changes
@@ -208,6 +218,12 @@ foreach ($record in $csvData)
         # Get current proxyAddresses and identify old primary SMTP
         $oldPrimarySMTP = $adUser.proxyAddresses | Where-Object { $_ -like "SMTP:*" }
         $currentProxyAddresses = @($adUser.proxyAddresses | Where-Object { $_ -notlike "SMTP:*" })
+
+        # If promoting existing secondary to primary, remove it from the list to avoid duplicates
+        if ($promoteExisting)
+        {
+            $currentProxyAddresses = @($currentProxyAddresses | Where-Object { $_ -cne "smtp:$newEmail" })
+        }
 
         # Log step 1: Remove old primary SMTP
         if ($oldPrimarySMTP)
