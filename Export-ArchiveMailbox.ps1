@@ -654,19 +654,40 @@ try
     Write-Log "Phase 2: Monitoring searches and creating exports as they complete..."
     Write-Log ""
 
-    $pendingSearches = $results | Where-Object { $_.Status -eq "SearchStarted" }
+    # Give searches a moment to start
+    Write-Log "Waiting for searches to initialize..."
+    Start-Sleep -Seconds 10
+
     $startTime = Get-Date
     $timeout = New-TimeSpan -Minutes $script:MaxWaitMinutes
 
-    while ($pendingSearches.Count -gt 0 -and ((Get-Date) - $startTime) -lt $timeout)
+    # Keep looping until all searches are done (ExportStarted, SearchFailed, or timeout)
+    while ($true)
     {
+        $pendingSearches = @($results | Where-Object { $_.Status -eq "SearchStarted" })
+
+        if ($pendingSearches.Count -eq 0)
+        {
+            Write-Log "All searches have completed or failed."
+            break
+        }
+
+        if (((Get-Date) - $startTime) -gt $timeout)
+        {
+            Write-Log "Timeout reached after $($script:MaxWaitMinutes) minutes" -Level WARNING
+            break
+        }
+
         foreach ($result in $pendingSearches)
         {
             try
             {
                 $search = Get-MgSecurityCaseEdiscoveryCaseSearch -EdiscoveryCaseId $caseId -EdiscoverySearchId $result.SearchId
+                $searchStatus = $search.Status
 
-                if ($search.Status -eq "succeeded" -or $search.Status -eq "completed")
+                Write-Log "  $($result.UPN): status = $searchStatus"
+
+                if ($searchStatus -eq "succeeded" -or $searchStatus -eq "completed")
                 {
                     Write-Log "Search completed for: $($result.UPN)"
 
@@ -684,18 +705,9 @@ try
                     # Get export operation ID
                     Start-Sleep -Seconds 2  # Brief pause to let operation register
                     $operations = Get-MgSecurityCaseEdiscoveryCaseOperation -EdiscoveryCaseId $caseId |
-                        Where-Object { $_.Action -eq "exportResult" -and $_.AdditionalProperties.searchId -eq $result.SearchId } |
+                        Where-Object { $_.Action -eq "exportResult" } |
                         Sort-Object -Property CreatedDateTime -Descending |
                         Select-Object -First 1
-
-                    if (-not $operations)
-                    {
-                        # Fallback: get most recent export operation
-                        $operations = Get-MgSecurityCaseEdiscoveryCaseOperation -EdiscoveryCaseId $caseId |
-                            Where-Object { $_.Action -eq "exportResult" } |
-                            Sort-Object -Property CreatedDateTime -Descending |
-                            Select-Object -First 1
-                    }
 
                     if ($operations)
                     {
@@ -705,12 +717,13 @@ try
 
                     $result.Status = "ExportStarted"
                 }
-                elseif ($search.Status -eq "failed")
+                elseif ($searchStatus -eq "failed")
                 {
                     Write-Log "Search failed for: $($result.UPN)" -Level ERROR
                     $result.Status = "SearchFailed"
                     $result.ErrorMessage = "Search failed"
                 }
+                # If status is "running", "notStarted", etc. - keep waiting
             }
             catch
             {
@@ -718,13 +731,13 @@ try
             }
         }
 
-        # Update pending list
-        $pendingSearches = $results | Where-Object { $_.Status -eq "SearchStarted" }
+        # Re-check pending count
+        $stillPending = @($results | Where-Object { $_.Status -eq "SearchStarted" }).Count
+        $completedCount = @($results | Where-Object { $_.Status -eq "ExportStarted" }).Count
 
-        if ($pendingSearches.Count -gt 0)
+        if ($stillPending -gt 0)
         {
-            $completedCount = ($results | Where-Object { $_.Status -eq "ExportStarted" }).Count
-            Write-Output "  Searches: $completedCount completed, $($pendingSearches.Count) pending - waiting $($script:SearchPollIntervalSeconds)s..."
+            Write-Output "  Status: $completedCount exports started, $stillPending searches still running - waiting $($script:SearchPollIntervalSeconds)s..."
             Start-Sleep -Seconds $script:SearchPollIntervalSeconds
         }
     }
@@ -883,11 +896,16 @@ try
     Write-Log "EXPORT COMPLETE"
     Write-Log "============================================================"
     Write-Log ""
+    $totalCount = @($results).Count
+    $completedCount = @($results | Where-Object { $_.Status -eq 'Completed' -or $_.Status -eq 'ExportCreated' -or $_.Status -eq 'ExportStarted' }).Count
+    $failedCount = @($results | Where-Object { $_.Status -like '*Failed*' -or $_.Status -like '*Timeout*' }).Count
+    $pendingCount = @($results | Where-Object { $_.Status -eq 'Pending' -or $_.Status -eq 'SearchStarted' }).Count
+
     Write-Log "Summary:"
-    Write-Log "  Total mailboxes: $($mailboxInfo.Count)"
-    Write-Log "  Completed: $(($results | Where-Object { $_.Status -eq 'Completed' }).Count)"
-    Write-Log "  Failed: $(($results | Where-Object { $_.Status -like '*Failed*' }).Count)"
-    Write-Log "  Pending: $(($results | Where-Object { $_.Status -eq 'Pending' -or $_.Status -eq 'ExportStarted' }).Count)"
+    Write-Log "  Total mailboxes: $totalCount"
+    Write-Log "  Exports ready: $completedCount"
+    Write-Log "  Failed: $failedCount"
+    Write-Log "  Still pending: $pendingCount"
     Write-Log ""
     Write-Log "Output files:"
     Write-Log "  Summary: $script:SummaryFile"
