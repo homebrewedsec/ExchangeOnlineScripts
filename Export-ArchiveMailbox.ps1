@@ -121,7 +121,7 @@ $script:MaxWaitMinutes = 180
 #endregion
 
 #region LOGGING FUNCTION
-function Write-Log
+function Write-ExportLog
 {
     param(
         [string]$Message,
@@ -160,7 +160,7 @@ function Get-ArchiveFolderQuery
         [string]$MailboxUPN
     )
 
-    Write-Log "Getting archive folder IDs for: $MailboxUPN"
+    Write-ExportLog "Getting archive folder IDs for: $MailboxUPN"
 
     try
     {
@@ -169,7 +169,7 @@ function Get-ArchiveFolderQuery
 
         if (-not $archiveFolders -or $archiveFolders.Count -eq 0)
         {
-            Write-Log "No archive folders found for: $MailboxUPN" -Level WARNING
+            Write-ExportLog "No archive folders found for: $MailboxUPN" -Level WARNING
             return $null
         }
 
@@ -192,11 +192,11 @@ function Get-ArchiveFolderQuery
 
         if (-not $userFolders -or $userFolders.Count -eq 0)
         {
-            Write-Log "No user folders found in archive for: $MailboxUPN" -Level WARNING
+            Write-ExportLog "No user folders found in archive for: $MailboxUPN" -Level WARNING
             return $null
         }
 
-        Write-Log "Found $($userFolders.Count) user folders in archive"
+        Write-ExportLog "Found $($userFolders.Count) user folders in archive"
 
         # Build folder ID query
         $folderQueries = @()
@@ -227,27 +227,27 @@ function Get-ArchiveFolderQuery
             catch
             {
                 # If conversion fails, skip this folder
-                Write-Log "Could not convert folder ID for: $($folder.FolderPath)" -Level WARNING
+                Write-ExportLog "Could not convert folder ID for: $($folder.FolderPath)" -Level WARNING
             }
         }
 
         if ($folderQueries.Count -eq 0)
         {
-            Write-Log "No valid folder IDs extracted for: $MailboxUPN" -Level WARNING
+            Write-ExportLog "No valid folder IDs extracted for: $MailboxUPN" -Level WARNING
             return $null
         }
 
         # Join folder queries with OR - ensure it's a string
         [string]$contentQuery = "(" + ($folderQueries -join " OR ") + ")"
 
-        Write-Log "Built query with $($folderQueries.Count) folder IDs"
-        Write-Log "Query length: $($contentQuery.Length) characters"
+        Write-ExportLog "Built query with $($folderQueries.Count) folder IDs"
+        Write-ExportLog "Query length: $($contentQuery.Length) characters"
 
         return $contentQuery
     }
     catch
     {
-        Write-Log "Error getting archive folders for $MailboxUPN : $($_.Exception.Message)" -Level ERROR
+        Write-ExportLog "Error getting archive folders for $MailboxUPN : $($_.Exception.Message)" -Level ERROR
         return $null
     }
 }
@@ -275,27 +275,34 @@ function Wait-SearchCompletion
         {
             $search = Get-MgSecurityCaseEdiscoveryCaseSearch -EdiscoveryCaseId $CaseId -EdiscoverySearchId $SearchId
 
-            if ($search.Status -eq "succeeded" -or $search.Status -eq "completed")
+            # Status is in lastEstimateStatisticsOperation, not directly on search object
+            $searchStatus = $null
+            if ($search.LastEstimateStatisticsOperation)
+            {
+                $searchStatus = $search.LastEstimateStatisticsOperation.Status
+            }
+
+            if ($searchStatus -eq "succeeded" -or $searchStatus -eq "completed")
             {
                 return $true
             }
-            elseif ($search.Status -eq "failed")
+            elseif ($searchStatus -eq "failed")
             {
-                Write-Log "Search failed: $SearchId" -Level ERROR
+                Write-ExportLog "Search failed: $SearchId" -Level ERROR
                 return $false
             }
 
-            Write-Output "  Search status: $($search.Status) - waiting..."
+            Write-Output "  Search status: $searchStatus - waiting..."
             Start-Sleep -Seconds $script:SearchPollIntervalSeconds
         }
         catch
         {
-            Write-Log "Error checking search status: $($_.Exception.Message)" -Level WARNING
+            Write-ExportLog "Error checking search status: $($_.Exception.Message)" -Level WARNING
             Start-Sleep -Seconds $script:SearchPollIntervalSeconds
         }
     }
 
-    Write-Log "Search timed out after $TimeoutMinutes minutes" -Level ERROR
+    Write-ExportLog "Search timed out after $TimeoutMinutes minutes" -Level ERROR
     return $false
 }
 
@@ -326,7 +333,7 @@ function Wait-ExportCompletion
             }
             elseif ($operation.Status -eq "failed")
             {
-                Write-Log "Export failed: $OperationId" -Level ERROR
+                Write-ExportLog "Export failed: $OperationId" -Level ERROR
                 return $null
             }
 
@@ -336,12 +343,12 @@ function Wait-ExportCompletion
         }
         catch
         {
-            Write-Log "Error checking export status: $($_.Exception.Message)" -Level WARNING
+            Write-ExportLog "Error checking export status: $($_.Exception.Message)" -Level WARNING
             Start-Sleep -Seconds $script:ExportPollIntervalSeconds
         }
     }
 
-    Write-Log "Export timed out after $TimeoutMinutes minutes" -Level ERROR
+    Write-ExportLog "Export timed out after $TimeoutMinutes minutes" -Level ERROR
     return $null
 }
 #endregion
@@ -350,22 +357,22 @@ function Wait-ExportCompletion
 
 try
 {
-    Write-Log "============================================================"
-    Write-Log "Exchange Online Archive Mailbox Export"
-    Write-Log "============================================================"
-    Write-Log "Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    Write-Log "Case Name: $script:FullCaseName"
-    Write-Log "Output Path: $OutputPath"
-    Write-Log ""
+    Write-ExportLog "============================================================"
+    Write-ExportLog "Exchange Online Archive Mailbox Export"
+    Write-ExportLog "============================================================"
+    Write-ExportLog "Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    Write-ExportLog "Case Name: $script:FullCaseName"
+    Write-ExportLog "Output Path: $OutputPath"
+    Write-ExportLog ""
 
     #region VALIDATE PREREQUISITES
-    Write-Log "Validating prerequisites..."
+    Write-ExportLog "Validating prerequisites..."
 
     # Check output directory
     if (-not (Test-Path $OutputPath))
     {
         New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
-        Write-Log "Created output directory: $OutputPath"
+        Write-ExportLog "Created output directory: $OutputPath"
     }
 
     # Check CSV file
@@ -388,7 +395,7 @@ try
     }
 
     $upnList = $csvData | Select-Object -ExpandProperty upn | Where-Object { $_ }
-    Write-Log "Found $($upnList.Count) mailboxes in CSV"
+    Write-ExportLog "Found $($upnList.Count) mailboxes in CSV"
 
     # Check required modules
     $requiredModules = @("ExchangeOnlineManagement", "Microsoft.Graph")
@@ -408,12 +415,12 @@ try
         }
     }
 
-    Write-Log "Prerequisites validated"
-    Write-Log ""
+    Write-ExportLog "Prerequisites validated"
+    Write-ExportLog ""
     #endregion
 
     #region CONNECT TO SERVICES
-    Write-Log "Connecting to services..."
+    Write-ExportLog "Connecting to services..."
 
     # Determine authentication mode
     $useAppAuth = $AppId -and $TenantId -and $CertificateThumbprint
@@ -422,7 +429,7 @@ try
     $exoSession = Get-ConnectionInformation -ErrorAction SilentlyContinue
     if (-not $exoSession -or $exoSession.State -ne "Connected")
     {
-        Write-Log "Connecting to Exchange Online..."
+        Write-ExportLog "Connecting to Exchange Online..."
         if ($useAppAuth)
         {
             Connect-ExchangeOnline -AppId $AppId -CertificateThumbprint $CertificateThumbprint -Organization "$TenantId.onmicrosoft.com" -ShowBanner:$false
@@ -434,14 +441,14 @@ try
     }
     else
     {
-        Write-Log "Using existing Exchange Online session"
+        Write-ExportLog "Using existing Exchange Online session"
     }
 
     # Connect to Microsoft Graph
     $graphContext = Get-MgContext -ErrorAction SilentlyContinue
     if (-not $graphContext)
     {
-        Write-Log "Connecting to Microsoft Graph..."
+        Write-ExportLog "Connecting to Microsoft Graph..."
         if ($useAppAuth)
         {
             $cert = Get-ChildItem "Cert:\CurrentUser\My\$CertificateThumbprint" -ErrorAction SilentlyContinue
@@ -462,15 +469,15 @@ try
     }
     else
     {
-        Write-Log "Using existing Microsoft Graph session"
+        Write-ExportLog "Using existing Microsoft Graph session"
     }
 
-    Write-Log "Connected to all services"
-    Write-Log ""
+    Write-ExportLog "Connected to all services"
+    Write-ExportLog ""
     #endregion
 
     #region ENUMERATE ARCHIVES AND GET SIZES
-    Write-Log "Enumerating archive mailboxes and sizes..."
+    Write-ExportLog "Enumerating archive mailboxes and sizes..."
 
     $mailboxInfo = @()
     $counter = 0
@@ -486,13 +493,13 @@ try
 
             if (-not $mailbox)
             {
-                Write-Log "Mailbox not found: $upn" -Level WARNING
+                Write-ExportLog "Mailbox not found: $upn" -Level WARNING
                 continue
             }
 
             if (-not $mailbox.ArchiveStatus -or $mailbox.ArchiveStatus -eq "None")
             {
-                Write-Log "No archive enabled for: $upn" -Level WARNING
+                Write-ExportLog "No archive enabled for: $upn" -Level WARNING
                 continue
             }
 
@@ -500,7 +507,7 @@ try
 
             if (-not $archiveStats)
             {
-                Write-Log "Could not get archive stats for: $upn" -Level WARNING
+                Write-ExportLog "Could not get archive stats for: $upn" -Level WARNING
                 continue
             }
 
@@ -522,7 +529,7 @@ try
         }
         catch
         {
-            Write-Log "Error processing $upn : $($_.Exception.Message)" -Level WARNING
+            Write-ExportLog "Error processing $upn : $($_.Exception.Message)" -Level WARNING
         }
     }
 
@@ -536,22 +543,22 @@ try
     # Sort by size descending (largest first)
     $mailboxInfo = $mailboxInfo | Sort-Object -Property ArchiveSizeBytes -Descending
 
-    Write-Log "Found $($mailboxInfo.Count) archive mailboxes to process"
-    Write-Log "Total archive size: $([math]::Round(($mailboxInfo | Measure-Object -Property ArchiveSizeBytes -Sum).Sum / 1GB, 2)) GB"
-    Write-Log "Processing order (largest first):"
+    Write-ExportLog "Found $($mailboxInfo.Count) archive mailboxes to process"
+    Write-ExportLog "Total archive size: $([math]::Round(($mailboxInfo | Measure-Object -Property ArchiveSizeBytes -Sum).Sum / 1GB, 2)) GB"
+    Write-ExportLog "Processing order (largest first):"
     foreach ($mb in $mailboxInfo | Select-Object -First 5)
     {
-        Write-Log "  - $($mb.UPN): $($mb.ArchiveSizeGB) GB ($($mb.ItemCount) items)"
+        Write-ExportLog "  - $($mb.UPN): $($mb.ArchiveSizeGB) GB ($($mb.ItemCount) items)"
     }
     if ($mailboxInfo.Count -gt 5)
     {
-        Write-Log "  ... and $($mailboxInfo.Count - 5) more"
+        Write-ExportLog "  ... and $($mailboxInfo.Count - 5) more"
     }
-    Write-Log ""
+    Write-ExportLog ""
     #endregion
 
     #region CREATE EDISCOVERY CASE
-    Write-Log "Creating eDiscovery case: $script:FullCaseName"
+    Write-ExportLog "Creating eDiscovery case: $script:FullCaseName"
 
     $caseParams = @{
         displayName  = $script:FullCaseName
@@ -562,13 +569,13 @@ try
     $case = New-MgSecurityCaseEdiscoveryCase -BodyParameter $caseParams
     $caseId = $case.Id
 
-    Write-Log "Created eDiscovery case: $caseId"
-    Write-Log ""
+    Write-ExportLog "Created eDiscovery case: $caseId"
+    Write-ExportLog ""
     #endregion
 
     #region PHASE 1: CREATE ALL SEARCHES
-    Write-Log "Phase 1: Creating compliance searches for all mailboxes..."
-    Write-Log ""
+    Write-ExportLog "Phase 1: Creating compliance searches for all mailboxes..."
+    Write-ExportLog ""
 
     $results = @()
     $searchCounter = 0
@@ -578,7 +585,7 @@ try
         $searchCounter++
         $upn = $mb.UPN
 
-        Write-Log "[$searchCounter/$($mailboxInfo.Count)] Creating search for: $upn ($($mb.ArchiveSizeGB) GB)"
+        Write-ExportLog "[$searchCounter/$($mailboxInfo.Count)] Creating search for: $upn ($($mb.ArchiveSizeGB) GB)"
 
         $result = [PSCustomObject]@{
             UPN              = $upn
@@ -613,7 +620,7 @@ try
 
             # Ensure contentQuery is a string
             [string]$queryString = $contentQuery
-            Write-Log "  Query type: $($queryString.GetType().Name), Length: $($queryString.Length)"
+            Write-ExportLog "  Query type: $($queryString.GetType().Name), Length: $($queryString.Length)"
 
             # Use direct parameters instead of BodyParameter to avoid serialization issues
             $search = New-MgSecurityCaseEdiscoveryCaseSearch `
@@ -623,7 +630,7 @@ try
                 -DataSourceScopes "allTenantMailboxes"
             $result.SearchId = $search.Id
 
-            Write-Log "  Created search: $($search.Id)"
+            Write-ExportLog "  Created search: $($search.Id)"
 
             # Add mailbox as data source
             $userSource = @{
@@ -637,29 +644,29 @@ try
             Invoke-MgEstimateSecurityCaseEdiscoveryCaseSearchStatistics -EdiscoveryCaseId $caseId -EdiscoverySearchId $search.Id | Out-Null
 
             $result.Status = "SearchStarted"
-            Write-Log "  Search started"
+            Write-ExportLog "  Search started"
         }
         catch
         {
             $result.Status = "Failed"
             $result.ErrorMessage = $_.Exception.Message
-            Write-Log "  Error: $($_.Exception.Message)" -Level ERROR
+            Write-ExportLog "  Error: $($_.Exception.Message)" -Level ERROR
         }
 
         $results += $result
     }
 
-    Write-Log ""
-    Write-Log "All $($results.Count) searches created."
-    Write-Log ""
+    Write-ExportLog ""
+    Write-ExportLog "All $($results.Count) searches created."
+    Write-ExportLog ""
     #endregion
 
     #region PHASE 2: MONITOR SEARCHES AND CREATE EXPORTS
-    Write-Log "Phase 2: Monitoring searches and creating exports as they complete..."
-    Write-Log ""
+    Write-ExportLog "Phase 2: Monitoring searches and creating exports as they complete..."
+    Write-ExportLog ""
 
     # Give searches a moment to start
-    Write-Log "Waiting for searches to initialize..."
+    Write-ExportLog "Waiting for searches to initialize..."
     Start-Sleep -Seconds 10
 
     $startTime = Get-Date
@@ -672,13 +679,13 @@ try
 
         if ($pendingSearches.Count -eq 0)
         {
-            Write-Log "All searches have completed or failed."
+            Write-ExportLog "All searches have completed or failed."
             break
         }
 
         if (((Get-Date) - $startTime) -gt $timeout)
         {
-            Write-Log "Timeout reached after $($script:MaxWaitMinutes) minutes" -Level WARNING
+            Write-ExportLog "Timeout reached after $($script:MaxWaitMinutes) minutes" -Level WARNING
             break
         }
 
@@ -686,14 +693,43 @@ try
         {
             try
             {
+                # Get search details - status is in lastEstimateStatisticsOperation, not directly on search
                 $search = Get-MgSecurityCaseEdiscoveryCaseSearch -EdiscoveryCaseId $caseId -EdiscoverySearchId $result.SearchId
-                $searchStatus = $search.Status
 
-                Write-Log "  $($result.UPN): status = $searchStatus"
+                # The status comes from the lastEstimateStatisticsOperation property
+                $searchStatus = $null
+                if ($search.LastEstimateStatisticsOperation)
+                {
+                    $searchStatus = $search.LastEstimateStatisticsOperation.Status
+                }
+
+                # If status still not available, query the operation directly
+                if (-not $searchStatus)
+                {
+                    try
+                    {
+                        $operations = Get-MgSecurityCaseEdiscoveryCaseOperation -EdiscoveryCaseId $caseId |
+                            Where-Object { $_.Action -eq "estimateStatistics" } |
+                            Sort-Object -Property CreatedDateTime -Descending |
+                            Select-Object -First 1
+
+                        if ($operations)
+                        {
+                            $searchStatus = $operations.Status
+                        }
+                    }
+                    catch
+                    {
+                        # Operations may not be available yet - continue checking
+                        Write-Verbose "Operations query failed, will retry: $($_.Exception.Message)"
+                    }
+                }
+
+                Write-ExportLog "  $($result.UPN): status = $searchStatus"
 
                 if ($searchStatus -eq "succeeded" -or $searchStatus -eq "completed")
                 {
-                    Write-Log "Search completed for: $($result.UPN)"
+                    Write-ExportLog "Search completed for: $($result.UPN)"
 
                     # Create export
                     $exportParams = @{
@@ -716,14 +752,14 @@ try
                     if ($operations)
                     {
                         $result.ExportId = $operations.Id
-                        Write-Log "  Export started: $($operations.Id)"
+                        Write-ExportLog "  Export started: $($operations.Id)"
                     }
 
                     $result.Status = "ExportStarted"
                 }
                 elseif ($searchStatus -eq "failed")
                 {
-                    Write-Log "Search failed for: $($result.UPN)" -Level ERROR
+                    Write-ExportLog "Search failed for: $($result.UPN)" -Level ERROR
                     $result.Status = "SearchFailed"
                     $result.ErrorMessage = "Search failed"
                 }
@@ -731,7 +767,7 @@ try
             }
             catch
             {
-                Write-Log "Error checking search for $($result.UPN): $($_.Exception.Message)" -Level WARNING
+                Write-ExportLog "Error checking search for $($result.UPN): $($_.Exception.Message)" -Level WARNING
             }
         }
 
@@ -753,15 +789,15 @@ try
         $result.ErrorMessage = "Search timed out after $($script:MaxWaitMinutes) minutes"
     }
 
-    Write-Log ""
-    Write-Log "All searches processed. $(($results | Where-Object { $_.Status -eq 'ExportStarted' }).Count) exports started."
-    Write-Log ""
+    Write-ExportLog ""
+    Write-ExportLog "All searches processed. $(($results | Where-Object { $_.Status -eq 'ExportStarted' }).Count) exports started."
+    Write-ExportLog ""
     #endregion
 
     #region WAIT FOR EXPORTS AND DOWNLOAD
     if (-not $SkipDownload)
     {
-        Write-Log "Downloading PST files..."
+        Write-ExportLog "Downloading PST files..."
 
         # Get MSAL token for download
         $downloadToken = $null
@@ -789,26 +825,26 @@ try
         {
             # Interactive mode - automated download requires app registration
             # Direct user to download from Purview portal instead
-            Write-Log ""
-            Write-Log "============================================================" -Level WARNING
-            Write-Log "INTERACTIVE MODE: Manual download required" -Level WARNING
-            Write-Log "============================================================" -Level WARNING
-            Write-Log "Automated PST download requires app registration with" -Level WARNING
-            Write-Log "eDiscovery.Download.Read permission." -Level WARNING
-            Write-Log "" -Level WARNING
-            Write-Log "Download your PST files from:" -Level WARNING
-            Write-Log "  https://compliance.microsoft.com/ediscovery" -Level WARNING
-            Write-Log "" -Level WARNING
-            Write-Log "Look for case: $script:FullCaseName" -Level WARNING
-            Write-Log "============================================================" -Level WARNING
-            Write-Log ""
+            Write-ExportLog ""
+            Write-ExportLog "============================================================" -Level WARNING
+            Write-ExportLog "INTERACTIVE MODE: Manual download required" -Level WARNING
+            Write-ExportLog "============================================================" -Level WARNING
+            Write-ExportLog "Automated PST download requires app registration with" -Level WARNING
+            Write-ExportLog "eDiscovery.Download.Read permission." -Level WARNING
+            Write-ExportLog "" -Level WARNING
+            Write-ExportLog "Download your PST files from:" -Level WARNING
+            Write-ExportLog "  https://compliance.microsoft.com/ediscovery" -Level WARNING
+            Write-ExportLog "" -Level WARNING
+            Write-ExportLog "Look for case: $script:FullCaseName" -Level WARNING
+            Write-ExportLog "============================================================" -Level WARNING
+            Write-ExportLog ""
             $SkipDownload = $true
         }
 
         # Check if download was disabled due to token failure
         if ($SkipDownload -or -not $downloadToken)
         {
-            Write-Log "Download skipped - exports available in Purview portal"
+            Write-ExportLog "Download skipped - exports available in Purview portal"
             foreach ($result in $results | Where-Object { $_.ExportId })
             {
                 $result.Status = "ExportCreated"
@@ -818,7 +854,7 @@ try
         {
         foreach ($result in $results | Where-Object { $_.ExportId })
         {
-            Write-Log "Waiting for export: $($result.UPN)..."
+            Write-ExportLog "Waiting for export: $($result.UPN)..."
 
             try
             {
@@ -851,7 +887,7 @@ try
                     $downloadUrl = $file.downloadUrl
                     $outputFile = Join-Path $OutputPath "$($result.UPN -replace '@', '_at_')_$fileName"
 
-                    Write-Log "  Downloading: $fileName"
+                    Write-ExportLog "  Downloading: $fileName"
 
                     $headers = @{
                         "Authorization"      = "Bearer $downloadToken"
@@ -866,7 +902,7 @@ try
                         $result.PstPath = $outputFile
                         $result.PstSizeGB = [math]::Round($fileSize / 1GB, 2)
                         $result.Status = "Completed"
-                        Write-Log "  Downloaded: $outputFile ($($result.PstSizeGB) GB)"
+                        Write-ExportLog "  Downloaded: $outputFile ($($result.PstSizeGB) GB)"
                     }
                 }
             }
@@ -874,14 +910,14 @@ try
             {
                 $result.Status = "DownloadFailed"
                 $result.ErrorMessage = $_.Exception.Message
-                Write-Log "  Download error: $($_.Exception.Message)" -Level ERROR
+                Write-ExportLog "  Download error: $($_.Exception.Message)" -Level ERROR
             }
         }
         } # End of download else block
     }
     else
     {
-        Write-Log "SkipDownload specified - PST files available in Purview portal"
+        Write-ExportLog "SkipDownload specified - PST files available in Purview portal"
         foreach ($result in $results | Where-Object { $_.ExportId })
         {
             $result.Status = "ExportCreated"
@@ -890,46 +926,46 @@ try
     #endregion
 
     #region GENERATE SUMMARY REPORT
-    Write-Log ""
-    Write-Log "Generating summary report..."
+    Write-ExportLog ""
+    Write-ExportLog "Generating summary report..."
 
     $results | Export-Csv -Path $script:SummaryFile -NoTypeInformation
 
-    Write-Log ""
-    Write-Log "============================================================"
-    Write-Log "EXPORT COMPLETE"
-    Write-Log "============================================================"
-    Write-Log ""
+    Write-ExportLog ""
+    Write-ExportLog "============================================================"
+    Write-ExportLog "EXPORT COMPLETE"
+    Write-ExportLog "============================================================"
+    Write-ExportLog ""
     $totalCount = @($results).Count
     $completedCount = @($results | Where-Object { $_.Status -eq 'Completed' -or $_.Status -eq 'ExportCreated' -or $_.Status -eq 'ExportStarted' }).Count
     $failedCount = @($results | Where-Object { $_.Status -like '*Failed*' -or $_.Status -like '*Timeout*' }).Count
     $pendingCount = @($results | Where-Object { $_.Status -eq 'Pending' -or $_.Status -eq 'SearchStarted' }).Count
 
-    Write-Log "Summary:"
-    Write-Log "  Total mailboxes: $totalCount"
-    Write-Log "  Exports ready: $completedCount"
-    Write-Log "  Failed: $failedCount"
-    Write-Log "  Still pending: $pendingCount"
-    Write-Log ""
-    Write-Log "Output files:"
-    Write-Log "  Summary: $script:SummaryFile"
-    Write-Log "  Log: $script:LogFile"
-    Write-Log "  PST files: $OutputPath"
-    Write-Log ""
-    Write-Log "eDiscovery Case: $script:FullCaseName (ID: $caseId)"
-    Write-Log "  View in Purview: https://compliance.microsoft.com/ediscovery"
-    Write-Log ""
+    Write-ExportLog "Summary:"
+    Write-ExportLog "  Total mailboxes: $totalCount"
+    Write-ExportLog "  Exports ready: $completedCount"
+    Write-ExportLog "  Failed: $failedCount"
+    Write-ExportLog "  Still pending: $pendingCount"
+    Write-ExportLog ""
+    Write-ExportLog "Output files:"
+    Write-ExportLog "  Summary: $script:SummaryFile"
+    Write-ExportLog "  Log: $script:LogFile"
+    Write-ExportLog "  PST files: $OutputPath"
+    Write-ExportLog ""
+    Write-ExportLog "eDiscovery Case: $script:FullCaseName (ID: $caseId)"
+    Write-ExportLog "  View in Purview: https://compliance.microsoft.com/ediscovery"
+    Write-ExportLog ""
     #endregion
 }
 catch
 {
-    Write-Log "Script execution failed: $($_.Exception.Message)" -Level ERROR
-    Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level ERROR
+    Write-ExportLog "Script execution failed: $($_.Exception.Message)" -Level ERROR
+    Write-ExportLog "Stack trace: $($_.ScriptStackTrace)" -Level ERROR
     exit 1
 }
 finally
 {
-    Write-Log "Script completed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    Write-ExportLog "Script completed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 }
 
 #endregion
