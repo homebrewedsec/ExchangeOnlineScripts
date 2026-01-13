@@ -272,8 +272,7 @@ function Wait-SearchCompletion
     {
         try
         {
-            $search = Get-MgSecurityCaseEdiscoveryCase -EdiscoveryCaseId $CaseId |
-                Get-MgSecurityCaseEdiscoveryCaseSearch -EdiscoverySearchId $SearchId
+            $search = Get-MgSecurityCaseEdiscoveryCaseSearch -EdiscoveryCaseId $CaseId -EdiscoverySearchId $SearchId
 
             if ($search.Status -eq "succeeded" -or $search.Status -eq "completed")
             {
@@ -566,8 +565,9 @@ try
     Write-Log ""
     #endregion
 
-    #region CREATE SEARCHES AND EXPORTS
-    Write-Log "Creating compliance searches for each mailbox..."
+    #region PHASE 1: CREATE ALL SEARCHES
+    Write-Log "Phase 1: Creating compliance searches for all mailboxes..."
+    Write-Log ""
 
     $results = @()
     $searchCounter = 0
@@ -577,7 +577,7 @@ try
         $searchCounter++
         $upn = $mb.UPN
 
-        Write-Log "[$searchCounter/$($mailboxInfo.Count)] Processing: $upn ($($mb.ArchiveSizeGB) GB)"
+        Write-Log "[$searchCounter/$($mailboxInfo.Count)] Creating search for: $upn ($($mb.ArchiveSizeGB) GB)"
 
         $result = [PSCustomObject]@{
             UPN              = $upn
@@ -585,6 +585,7 @@ try
             ArchiveSizeGB    = $mb.ArchiveSizeGB
             ItemCount        = $mb.ItemCount
             SearchId         = $null
+            SearchName       = $null
             ExportId         = $null
             PstPath          = $null
             PstSizeGB        = $null
@@ -607,6 +608,7 @@ try
 
             # Create search
             $searchName = "Archive_$($upn -replace '@', '_at_')_$script:Timestamp"
+            $result.SearchName = $searchName
 
             $searchParams = @{
                 displayName      = $searchName
@@ -627,51 +629,11 @@ try
 
             New-MgSecurityCaseEdiscoveryCaseSearchAdditionalSource -EdiscoveryCaseId $caseId -EdiscoverySearchId $search.Id -BodyParameter $userSource | Out-Null
 
-            Write-Log "  Added data source: $upn"
-
-            # Start search estimate
+            # Start search estimate (non-blocking)
             Invoke-MgEstimateSecurityCaseEdiscoveryCaseSearchStatistics -EdiscoveryCaseId $caseId -EdiscoverySearchId $search.Id | Out-Null
 
-            Write-Log "  Started search estimate"
-
-            # Wait for search to complete
-            Write-Log "  Waiting for search to complete..."
-            $searchComplete = Wait-SearchCompletion -CaseId $caseId -SearchId $search.Id
-
-            if (-not $searchComplete)
-            {
-                $result.Status = "SearchFailed"
-                $result.ErrorMessage = "Search did not complete successfully"
-                $results += $result
-                continue
-            }
-
-            Write-Log "  Search completed"
-
-            # Export to PST
-            $exportParams = @{
-                displayName       = "Export_$searchName"
-                exportCriteria    = "searchHits"
-                exportformats     = "pst"
-                additionalOptions = "subfolderContents"
-                exportLocation    = "responsiveLocations"
-            }
-
-            $null = Export-MgSecurityCaseEdiscoveryCaseSearchResult -EdiscoveryCaseId $caseId -EdiscoverySearchId $search.Id -BodyParameter $exportParams
-
-            # Get the operation ID from the response
-            $operations = Get-MgSecurityCaseEdiscoveryCaseOperation -EdiscoveryCaseId $caseId |
-                Where-Object { $_.Action -eq "exportResult" } |
-                Sort-Object -Property CreatedDateTime -Descending |
-                Select-Object -First 1
-
-            if ($operations)
-            {
-                $result.ExportId = $operations.Id
-                Write-Log "  Started export: $($operations.Id)"
-            }
-
-            $result.Status = "ExportStarted"
+            $result.Status = "SearchStarted"
+            Write-Log "  Search started"
         }
         catch
         {
@@ -684,7 +646,98 @@ try
     }
 
     Write-Log ""
-    Write-Log "All searches created. Waiting for exports to complete..."
+    Write-Log "All $($results.Count) searches created."
+    Write-Log ""
+    #endregion
+
+    #region PHASE 2: MONITOR SEARCHES AND CREATE EXPORTS
+    Write-Log "Phase 2: Monitoring searches and creating exports as they complete..."
+    Write-Log ""
+
+    $pendingSearches = $results | Where-Object { $_.Status -eq "SearchStarted" }
+    $startTime = Get-Date
+    $timeout = New-TimeSpan -Minutes $script:MaxWaitMinutes
+
+    while ($pendingSearches.Count -gt 0 -and ((Get-Date) - $startTime) -lt $timeout)
+    {
+        foreach ($result in $pendingSearches)
+        {
+            try
+            {
+                $search = Get-MgSecurityCaseEdiscoveryCaseSearch -EdiscoveryCaseId $caseId -EdiscoverySearchId $result.SearchId
+
+                if ($search.Status -eq "succeeded" -or $search.Status -eq "completed")
+                {
+                    Write-Log "Search completed for: $($result.UPN)"
+
+                    # Create export
+                    $exportParams = @{
+                        displayName       = "Export_$($result.SearchName)"
+                        exportCriteria    = "searchHits"
+                        exportformats     = "pst"
+                        additionalOptions = "subfolderContents"
+                        exportLocation    = "responsiveLocations"
+                    }
+
+                    $null = Export-MgSecurityCaseEdiscoveryCaseSearchResult -EdiscoveryCaseId $caseId -EdiscoverySearchId $result.SearchId -BodyParameter $exportParams
+
+                    # Get export operation ID
+                    Start-Sleep -Seconds 2  # Brief pause to let operation register
+                    $operations = Get-MgSecurityCaseEdiscoveryCaseOperation -EdiscoveryCaseId $caseId |
+                        Where-Object { $_.Action -eq "exportResult" -and $_.AdditionalProperties.searchId -eq $result.SearchId } |
+                        Sort-Object -Property CreatedDateTime -Descending |
+                        Select-Object -First 1
+
+                    if (-not $operations)
+                    {
+                        # Fallback: get most recent export operation
+                        $operations = Get-MgSecurityCaseEdiscoveryCaseOperation -EdiscoveryCaseId $caseId |
+                            Where-Object { $_.Action -eq "exportResult" } |
+                            Sort-Object -Property CreatedDateTime -Descending |
+                            Select-Object -First 1
+                    }
+
+                    if ($operations)
+                    {
+                        $result.ExportId = $operations.Id
+                        Write-Log "  Export started: $($operations.Id)"
+                    }
+
+                    $result.Status = "ExportStarted"
+                }
+                elseif ($search.Status -eq "failed")
+                {
+                    Write-Log "Search failed for: $($result.UPN)" -Level ERROR
+                    $result.Status = "SearchFailed"
+                    $result.ErrorMessage = "Search failed"
+                }
+            }
+            catch
+            {
+                Write-Log "Error checking search for $($result.UPN): $($_.Exception.Message)" -Level WARNING
+            }
+        }
+
+        # Update pending list
+        $pendingSearches = $results | Where-Object { $_.Status -eq "SearchStarted" }
+
+        if ($pendingSearches.Count -gt 0)
+        {
+            $completedCount = ($results | Where-Object { $_.Status -eq "ExportStarted" }).Count
+            Write-Output "  Searches: $completedCount completed, $($pendingSearches.Count) pending - waiting $($script:SearchPollIntervalSeconds)s..."
+            Start-Sleep -Seconds $script:SearchPollIntervalSeconds
+        }
+    }
+
+    # Check for timeouts
+    foreach ($result in $results | Where-Object { $_.Status -eq "SearchStarted" })
+    {
+        $result.Status = "SearchTimeout"
+        $result.ErrorMessage = "Search timed out after $($script:MaxWaitMinutes) minutes"
+    }
+
+    Write-Log ""
+    Write-Log "All searches processed. $(($results | Where-Object { $_.Status -eq 'ExportStarted' }).Count) exports started."
     Write-Log ""
     #endregion
 
