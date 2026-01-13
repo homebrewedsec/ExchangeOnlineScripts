@@ -163,14 +163,16 @@ function Get-ArchiveFolderQuery
 
     try
     {
-        # Get archive folder statistics
-        $archiveFolders = Get-MailboxFolderStatistics -Identity $MailboxUPN -Archive -ErrorAction Stop
+        # Get archive folder statistics - use ResultSize Unlimited to get ALL folders
+        $archiveFolders = Get-MailboxFolderStatistics -Identity $MailboxUPN -Archive -ResultSize Unlimited -ErrorAction Stop
 
         if (-not $archiveFolders -or $archiveFolders.Count -eq 0)
         {
             Write-ExportLog "No archive folders found for: $MailboxUPN" -Level WARNING
             return $null
         }
+
+        Write-ExportLog "Total folders in archive: $($archiveFolders.Count)"
 
         # Filter out system folders
         $userFolders = $archiveFolders | Where-Object {
@@ -236,13 +238,49 @@ function Get-ArchiveFolderQuery
             return $null
         }
 
-        # Join folder queries with OR - ensure it's a string
-        [string]$contentQuery = "(" + ($folderQueries -join " OR ") + ")"
+        Write-ExportLog "Built $($folderQueries.Count) folder ID queries"
 
-        Write-ExportLog "Built query with $($folderQueries.Count) folder IDs"
-        Write-ExportLog "Query length: $($contentQuery.Length) characters"
+        # eDiscovery has a query length limit (~16KB is safe, truncation happens around 64KB)
+        # Split into multiple queries if needed
+        $maxQueryLength = 16000
+        $queries = @()
+        $currentBatch = @()
+        $currentLength = 2  # Start with 2 for opening/closing parentheses
 
-        return $contentQuery
+        foreach ($fq in $folderQueries)
+        {
+            $addLength = $fq.Length + 4  # " OR " separator
+            if (($currentLength + $addLength) -gt $maxQueryLength -and $currentBatch.Count -gt 0)
+            {
+                # Save current batch and start new one
+                $queries += "(" + ($currentBatch -join " OR ") + ")"
+                $currentBatch = @()
+                $currentLength = 2
+            }
+            $currentBatch += $fq
+            $currentLength += $addLength
+        }
+
+        # Add final batch
+        if ($currentBatch.Count -gt 0)
+        {
+            $queries += "(" + ($currentBatch -join " OR ") + ")"
+        }
+
+        if ($queries.Count -eq 1)
+        {
+            Write-ExportLog "Query length: $($queries[0].Length) characters"
+            return $queries[0]
+        }
+        else
+        {
+            Write-ExportLog "Large mailbox - split into $($queries.Count) queries (max $maxQueryLength chars each)"
+            foreach ($i in 0..($queries.Count - 1))
+            {
+                Write-ExportLog "  Query $($i + 1): $($queries[$i].Length) characters"
+            }
+            return $queries
+        }
     }
     catch
     {
@@ -272,14 +310,13 @@ function Wait-SearchCompletion
     {
         try
         {
-            $search = Get-MgSecurityCaseEdiscoveryCaseSearch -EdiscoveryCaseId $CaseId -EdiscoverySearchId $SearchId
+            # Must use -ExpandProperty to get the status from lastEstimateStatisticsOperation
+            $search = Get-MgSecurityCaseEdiscoveryCaseSearch `
+                -EdiscoveryCaseId $CaseId `
+                -EdiscoverySearchId $SearchId `
+                -ExpandProperty "lastEstimateStatisticsOperation"
 
-            # Status is in lastEstimateStatisticsOperation, not directly on search object
-            $searchStatus = $null
-            if ($search.LastEstimateStatisticsOperation)
-            {
-                $searchStatus = $search.LastEstimateStatisticsOperation.Status
-            }
+            $searchStatus = $search.LastEstimateStatisticsOperation.Status
 
             if ($searchStatus -eq "succeeded" -or $searchStatus -eq "completed")
             {
@@ -594,10 +631,10 @@ try
 
         try
         {
-            # Get archive folder query
-            $contentQuery = Get-ArchiveFolderQuery -MailboxUPN $upn
+            # Get archive folder query (may return array for large mailboxes)
+            $contentQueries = Get-ArchiveFolderQuery -MailboxUPN $upn
 
-            if (-not $contentQuery)
+            if (-not $contentQueries)
             {
                 $result.Status = "Failed"
                 $result.ErrorMessage = "Could not build folder query"
@@ -605,37 +642,51 @@ try
                 continue
             }
 
-            # Create search
-            $searchName = "Archive_$($upn -replace '@', '_at_')_$script:Timestamp"
-            $result.SearchName = $searchName
-
-            # Ensure contentQuery is a string
-            [string]$queryString = $contentQuery
-            Write-ExportLog "  Query type: $($queryString.GetType().Name), Length: $($queryString.Length)"
-
-            # Use direct parameters instead of BodyParameter to avoid serialization issues
-            $search = New-MgSecurityCaseEdiscoveryCaseSearch `
-                -EdiscoveryCaseId $caseId `
-                -DisplayName $searchName `
-                -ContentQuery $queryString `
-                -DataSourceScopes "allTenantMailboxes"
-            $result.SearchId = $search.Id
-
-            Write-ExportLog "  Created search: $($search.Id)"
-
-            # Add mailbox as data source
-            $userSource = @{
-                "@odata.type" = "microsoft.graph.security.userSource"
-                email         = $upn
+            # Ensure it's an array for consistent handling
+            if ($contentQueries -is [string])
+            {
+                $contentQueries = @($contentQueries)
             }
 
-            New-MgSecurityCaseEdiscoveryCaseSearchAdditionalSource -EdiscoveryCaseId $caseId -EdiscoverySearchId $search.Id -BodyParameter $userSource | Out-Null
+            # Create search(es) - multiple if mailbox has many folders
+            $searchIds = @()
+            $searchPartNum = 0
 
-            # Start search estimate (non-blocking)
-            Invoke-MgEstimateSecurityCaseEdiscoveryCaseSearchStatistics -EdiscoveryCaseId $caseId -EdiscoverySearchId $search.Id | Out-Null
+            foreach ($queryString in $contentQueries)
+            {
+                $searchPartNum++
+                $searchSuffix = if ($contentQueries.Count -gt 1) { "_Part$searchPartNum" } else { "" }
+                $searchName = "Archive_$($upn -replace '@', '_at_')_$script:Timestamp$searchSuffix"
 
+                Write-ExportLog "  Creating search$searchSuffix (query length: $($queryString.Length) chars)"
+
+                # Use direct parameters instead of BodyParameter to avoid serialization issues
+                $search = New-MgSecurityCaseEdiscoveryCaseSearch `
+                    -EdiscoveryCaseId $caseId `
+                    -DisplayName $searchName `
+                    -ContentQuery $queryString `
+                    -DataSourceScopes "allTenantMailboxes"
+
+                Write-ExportLog "  Created search: $($search.Id)"
+
+                # Add mailbox as data source
+                $userSource = @{
+                    "@odata.type" = "microsoft.graph.security.userSource"
+                    email         = $upn
+                }
+
+                New-MgSecurityCaseEdiscoveryCaseSearchAdditionalSource -EdiscoveryCaseId $caseId -EdiscoverySearchId $search.Id -BodyParameter $userSource | Out-Null
+
+                # Start search estimate (non-blocking)
+                Invoke-MgEstimateSecurityCaseEdiscoveryCaseSearchStatistics -EdiscoveryCaseId $caseId -EdiscoverySearchId $search.Id | Out-Null
+
+                $searchIds += $search.Id
+            }
+
+            $result.SearchName = "Archive_$($upn -replace '@', '_at_')_$script:Timestamp"
+            $result.SearchId = $searchIds -join ";"  # Store multiple IDs separated by semicolon
             $result.Status = "SearchStarted"
-            Write-ExportLog "  Search started"
+            Write-ExportLog "  $($searchIds.Count) search(es) started"
         }
         catch
         {
@@ -684,77 +735,82 @@ try
         {
             try
             {
-                # Get search details - status is in lastEstimateStatisticsOperation, not directly on search
-                $search = Get-MgSecurityCaseEdiscoveryCaseSearch -EdiscoveryCaseId $caseId -EdiscoverySearchId $result.SearchId
+                # Handle multiple search IDs (for large mailboxes split into parts)
+                $searchIds = $result.SearchId -split ";"
+                $allSearchesComplete = $true
+                $anySearchFailed = $false
+                $searchStatuses = @()
 
-                # The status comes from the lastEstimateStatisticsOperation property
-                $searchStatus = $null
-                if ($search.LastEstimateStatisticsOperation)
+                foreach ($searchId in $searchIds)
                 {
-                    $searchStatus = $search.LastEstimateStatisticsOperation.Status
+                    # Get search details with expanded lastEstimateStatisticsOperation (required to get status)
+                    $search = Get-MgSecurityCaseEdiscoveryCaseSearch `
+                        -EdiscoveryCaseId $caseId `
+                        -EdiscoverySearchId $searchId `
+                        -ExpandProperty "lastEstimateStatisticsOperation"
+
+                    $status = $search.LastEstimateStatisticsOperation.Status
+                    $searchStatuses += $status
+
+                    if ($status -eq "failed")
+                    {
+                        $anySearchFailed = $true
+                    }
+                    elseif ($status -ne "succeeded" -and $status -ne "completed")
+                    {
+                        $allSearchesComplete = $false
+                    }
                 }
 
-                # If status still not available, query the operation directly
-                if (-not $searchStatus)
+                $statusSummary = ($searchStatuses | Select-Object -Unique) -join "/"
+                Write-ExportLog "  $($result.UPN): status = $statusSummary ($($searchIds.Count) search(es))"
+
+                if ($anySearchFailed)
                 {
-                    try
+                    Write-ExportLog "Search failed for: $($result.UPN)" -Level ERROR
+                    $result.Status = "SearchFailed"
+                    $result.ErrorMessage = "One or more searches failed"
+                }
+                elseif ($allSearchesComplete)
+                {
+                    Write-ExportLog "All searches completed for: $($result.UPN)"
+
+                    # Create exports for each search
+                    $exportIds = @()
+                    $partNum = 0
+                    foreach ($searchId in $searchIds)
                     {
+                        $partNum++
+                        $exportSuffix = if ($searchIds.Count -gt 1) { "_Part$partNum" } else { "" }
+
+                        $exportParams = @{
+                            displayName       = "Export_$($result.SearchName)$exportSuffix"
+                            exportCriteria    = "searchHits"
+                            exportFormat      = "pst"
+                            additionalOptions = "subfolderContents"
+                            exportLocation    = "responsiveLocations"
+                        }
+
+                        Export-MgSecurityCaseEdiscoveryCaseSearchResult -EdiscoveryCaseId $caseId -EdiscoverySearchId $searchId -BodyParameter $exportParams | Out-Null
+
+                        # Get export operation ID
+                        Start-Sleep -Seconds 2
                         $operations = Get-MgSecurityCaseEdiscoveryCaseOperation -EdiscoveryCaseId $caseId |
-                            Where-Object { $_.Action -eq "estimateStatistics" } |
+                            Where-Object { $_.Action -eq "exportResult" } |
                             Sort-Object -Property CreatedDateTime -Descending |
                             Select-Object -First 1
 
                         if ($operations)
                         {
-                            $searchStatus = $operations.Status
+                            $exportIds += $operations.Id
+                            Write-ExportLog "  Export started: $($operations.Id)"
                         }
                     }
-                    catch
-                    {
-                        # Operations may not be available yet - continue checking
-                        Write-Verbose "Operations query failed, will retry: $($_.Exception.Message)"
-                    }
-                }
 
-                Write-ExportLog "  $($result.UPN): status = $searchStatus"
-
-                if ($searchStatus -eq "succeeded" -or $searchStatus -eq "completed")
-                {
-                    Write-ExportLog "Search completed for: $($result.UPN)"
-
-                    # Create export
-                    $exportParams = @{
-                        displayName       = "Export_$($result.SearchName)"
-                        exportCriteria    = "searchHits"
-                        exportformats     = "pst"
-                        additionalOptions = "subfolderContents"
-                        exportLocation    = "responsiveLocations"
-                    }
-
-                    $null = Export-MgSecurityCaseEdiscoveryCaseSearchResult -EdiscoveryCaseId $caseId -EdiscoverySearchId $result.SearchId -BodyParameter $exportParams
-
-                    # Get export operation ID
-                    Start-Sleep -Seconds 2  # Brief pause to let operation register
-                    $operations = Get-MgSecurityCaseEdiscoveryCaseOperation -EdiscoveryCaseId $caseId |
-                        Where-Object { $_.Action -eq "exportResult" } |
-                        Sort-Object -Property CreatedDateTime -Descending |
-                        Select-Object -First 1
-
-                    if ($operations)
-                    {
-                        $result.ExportId = $operations.Id
-                        Write-ExportLog "  Export started: $($operations.Id)"
-                    }
-
+                    $result.ExportId = $exportIds -join ";"
                     $result.Status = "ExportStarted"
                 }
-                elseif ($searchStatus -eq "failed")
-                {
-                    Write-ExportLog "Search failed for: $($result.UPN)" -Level ERROR
-                    $result.Status = "SearchFailed"
-                    $result.ErrorMessage = "Search failed"
-                }
-                # If status is "running", "notStarted", etc. - keep waiting
+                # If not all complete and none failed - keep waiting (status is "running", "notStarted", etc.)
             }
             catch
             {
