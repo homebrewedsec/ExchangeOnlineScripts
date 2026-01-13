@@ -42,9 +42,14 @@
 
 .PARAMETER ClientSecret
     Client secret for app-only authentication.
-    Alternative to CertificateThumbprint. Required for automated PST downloads.
-    App registration needs eDiscovery.ReadWrite.All (Graph) and permissions on
-    MicrosoftPurviewEDiscovery (b26e684c-5068-4120-a679-64a5d2c909d9) for downloads.
+    Alternative to CertificateThumbprint.
+    App registration needs eDiscovery.ReadWrite.All (Graph).
+
+.PARAMETER MaxBatchSizeGB
+    Maximum total archive size per eDiscovery case in GB.
+    When adding the next mailbox would exceed this limit, a new case is created.
+    Default is 0 (unlimited - all mailboxes in one case).
+    Recommended: 500-1000 GB per case for large migrations.
 
 .PARAMETER SkipDownload
     Create searches and exports only, skip PST download.
@@ -69,6 +74,10 @@
 .EXAMPLE
     .\Export-ArchiveMailbox.ps1 -InputCsvPath "mailboxes.csv" -SkipDownload
     Creates eDiscovery searches and exports without downloading (download via portal).
+
+.EXAMPLE
+    .\Export-ArchiveMailbox.ps1 -InputCsvPath "mailboxes.csv" -MaxBatchSizeGB 750
+    Splits mailboxes into batches of ~750GB each, creating a separate eDiscovery case per batch.
 
 .NOTES
     Author: Hudson Bush, Seguri - hudson@seguri.io
@@ -102,6 +111,8 @@ param(
     [string]$CertificateThumbprint,
 
     [string]$ClientSecret,
+
+    [int]$MaxBatchSizeGB = 0,
 
     [switch]$SkipDownload
 )
@@ -614,52 +625,124 @@ try
         Write-ExportLog "  ... and $($mailboxInfo.Count - 5) more"
     }
     Write-ExportLog ""
-    #endregion
 
-    #region CREATE EDISCOVERY CASE
-    Write-ExportLog "Creating eDiscovery case: $script:FullCaseName"
-
-    $caseParams = @{
-        displayName  = $script:FullCaseName
-        description  = "Archive mailbox export for migration - Created $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
-        externalId   = "ArchiveExport-$script:Timestamp"
-    }
-
-    $case = New-MgSecurityCaseEdiscoveryCase -BodyParameter $caseParams
-    $caseId = $case.Id
-
-    Write-ExportLog "Created eDiscovery case: $caseId"
-    Write-ExportLog ""
-    #endregion
-
-    #region PHASE 1: CREATE ALL SEARCHES
-    Write-ExportLog "Phase 1: Creating compliance searches for all mailboxes..."
-    Write-ExportLog ""
-
-    $results = @()
-    $searchCounter = 0
-
-    foreach ($mb in $mailboxInfo)
+    #region SPLIT INTO BATCHES
+    # Split mailboxes into batches based on MaxBatchSizeGB
+    $batches = @()
+    if ($MaxBatchSizeGB -gt 0)
     {
-        $searchCounter++
-        $upn = $mb.UPN
+        $maxBatchBytes = [long]$MaxBatchSizeGB * 1GB
+        $currentBatch = @()
+        $currentBatchSize = 0
 
-        Write-ExportLog "[$searchCounter/$($mailboxInfo.Count)] Creating search for: $upn ($($mb.ArchiveSizeGB) GB)"
+        foreach ($mb in $mailboxInfo)
+        {
+            # If adding this mailbox would exceed the limit and we have items, start new batch
+            if ($currentBatchSize + $mb.ArchiveSizeBytes -gt $maxBatchBytes -and $currentBatch.Count -gt 0)
+            {
+                $batches += ,@($currentBatch)
+                $currentBatch = @()
+                $currentBatchSize = 0
+            }
 
-        $result = [PSCustomObject]@{
-            UPN              = $upn
-            DisplayName      = $mb.DisplayName
-            ArchiveSizeGB    = $mb.ArchiveSizeGB
-            ItemCount        = $mb.ItemCount
-            SearchId         = $null
-            SearchName       = $null
-            ExportId         = $null
-            ExportUrl        = $null
-            PstPath          = $null
-            PstSizeGB        = $null
-            Status           = "Pending"
-            ErrorMessage     = $null
+            $currentBatch += $mb
+            $currentBatchSize += $mb.ArchiveSizeBytes
         }
+
+        # Add final batch
+        if ($currentBatch.Count -gt 0)
+        {
+            $batches += ,@($currentBatch)
+        }
+
+        Write-ExportLog "Split into $($batches.Count) batches (max $MaxBatchSizeGB GB each):"
+        for ($i = 0; $i -lt $batches.Count; $i++)
+        {
+            $batchSize = [math]::Round(($batches[$i] | Measure-Object -Property ArchiveSizeBytes -Sum).Sum / 1GB, 2)
+            Write-ExportLog "  Batch $($i + 1): $($batches[$i].Count) mailboxes, $batchSize GB"
+        }
+        Write-ExportLog ""
+    }
+    else
+    {
+        # Single batch with all mailboxes
+        $batches = @(,@($mailboxInfo))
+    }
+    #endregion
+
+    # Track all results and cases across batches
+    $allResults = @()
+    $allCases = @()
+
+    #region PROCESS EACH BATCH
+    for ($batchNum = 0; $batchNum -lt $batches.Count; $batchNum++)
+    {
+        $batchMailboxes = $batches[$batchNum]
+        $batchLabel = if ($batches.Count -gt 1) { "_Batch$($batchNum + 1)" } else { "" }
+
+        Write-ExportLog "============================================================"
+        Write-ExportLog "PROCESSING BATCH $($batchNum + 1) OF $($batches.Count)"
+        Write-ExportLog "  Mailboxes: $($batchMailboxes.Count)"
+        Write-ExportLog "  Size: $([math]::Round(($batchMailboxes | Measure-Object -Property ArchiveSizeBytes -Sum).Sum / 1GB, 2)) GB"
+        Write-ExportLog "============================================================"
+        Write-ExportLog ""
+
+        #region CREATE EDISCOVERY CASE
+        $batchCaseName = "$script:FullCaseName$batchLabel"
+        Write-ExportLog "Creating eDiscovery case: $batchCaseName"
+
+        $caseParams = @{
+            displayName  = $batchCaseName
+            description  = "Archive mailbox export for migration - Batch $($batchNum + 1) of $($batches.Count) - Created $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+            externalId   = "ArchiveExport-$script:Timestamp$batchLabel"
+        }
+
+        $case = New-MgSecurityCaseEdiscoveryCase -BodyParameter $caseParams
+        $caseId = $case.Id
+
+        $allCases += [PSCustomObject]@{
+            BatchNum = $batchNum + 1
+            CaseName = $batchCaseName
+            CaseId   = $caseId
+            MailboxCount = $batchMailboxes.Count
+            Url = "https://compliance.microsoft.com/contentsearchv2?caseId=$caseId&caseType=eDiscovery"
+        }
+
+        Write-ExportLog "Created eDiscovery case: $caseId"
+        Write-ExportLog ""
+        #endregion
+
+        #region PHASE 1: CREATE ALL SEARCHES
+        Write-ExportLog "Phase 1: Creating compliance searches..."
+        Write-ExportLog ""
+
+        $results = @()
+        $searchCounter = 0
+
+        foreach ($mb in $batchMailboxes)
+        {
+            $searchCounter++
+            $upn = $mb.UPN
+
+            Write-ExportLog "[$searchCounter/$($batchMailboxes.Count)] Creating search for: $upn ($($mb.ArchiveSizeGB) GB)"
+
+            $result = [PSCustomObject]@{
+                UPN              = $upn
+                DisplayName      = $mb.DisplayName
+                ArchiveSizeGB    = $mb.ArchiveSizeGB
+                ItemCount        = $mb.ItemCount
+                BatchNum         = $batchNum + 1
+                CaseId           = $caseId
+                CaseName         = $batchCaseName
+                SearchId         = $null
+                SearchName       = $null
+                ExportId         = $null
+                ExportUrl        = $null
+                PstPath          = $null
+                PstSizeGB        = $null
+                Status           = "Pending"
+                ErrorMessage     = $null
+            }
 
         try
         {
@@ -877,9 +960,17 @@ try
     #endregion
 
     #region WAIT FOR EXPORTS AND DOWNLOAD
+    # Note: Automated download via API is not supported by Microsoft for Purview eDiscovery.
+    # The download URLs require interactive user authentication.
+    # Downloads must be done manually from the Purview portal.
+
     if (-not $SkipDownload)
     {
-        Write-ExportLog "Waiting for exports to complete and downloading PST files..."
+        Write-ExportLog "Waiting for exports to complete..."
+        Write-ExportLog ""
+        Write-ExportLog "NOTE: Automated download is not supported by Microsoft."
+        Write-ExportLog "      Downloads must be done manually from the Purview portal."
+        Write-ExportLog ""
 
         foreach ($result in $results | Where-Object { $_.ExportId })
         {
@@ -887,181 +978,41 @@ try
 
             try
             {
-                $operation = Wait-ExportCompletion -CaseId $caseId -OperationId $result.ExportId
+                # Handle multiple export IDs (for split searches)
+                $exportIds = $result.ExportId -split ";"
+                $allExportsComplete = $true
 
-                if (-not $operation)
+                foreach ($exportId in $exportIds)
+                {
+                    $operation = Wait-ExportCompletion -CaseId $caseId -OperationId $exportId
+
+                    if (-not $operation)
+                    {
+                        $allExportsComplete = $false
+                        Write-ExportLog "  Export $exportId did not complete" -Level WARNING
+                    }
+                    else
+                    {
+                        Write-ExportLog "  Export $exportId completed"
+                    }
+                }
+
+                if ($allExportsComplete)
+                {
+                    $result.Status = "ReadyForDownload"
+                    Write-ExportLog "  All exports ready for manual download"
+                }
+                else
                 {
                     $result.Status = "ExportFailed"
-                    $result.ErrorMessage = "Export did not complete"
-                    continue
-                }
-
-                # Get download URLs
-                $uri = "/v1.0/security/cases/ediscoveryCases/$caseId/operations/$($result.ExportId)"
-                $exportInfo = Invoke-MgGraphRequest -Uri $uri
-
-                $fileMetadata = $exportInfo.exportFileMetadata
-
-                if (-not $fileMetadata)
-                {
-                    $result.Status = "NoFiles"
-                    $result.ErrorMessage = "No export files found"
-                    continue
-                }
-
-                # Download each file - try multiple methods
-                foreach ($file in $fileMetadata)
-                {
-                    $fileName = $file.fileName
-                    $downloadUrl = $file.downloadUrl
-
-                    # Simplify the output filename - handle multiple parts
-                    $partMatch = if ($fileName -match "Part(\d+)") { "_Part$($matches[1])" } else { "" }
-                    $simpleFileName = if ($fileName -like "PSTs*") {
-                        "$($result.UPN -replace '@', '_at_')$partMatch.pst.zip"
-                    } else {
-                        "$($result.UPN -replace '@', '_at_')$partMatch_report.zip"
-                    }
-                    $outputFile = Join-Path $OutputPath $simpleFileName
-
-                    Write-ExportLog "  Downloading: $fileName -> $simpleFileName"
-
-                    $downloadSuccess = $false
-
-                    # Method 1: Try with Purview eDiscovery token (if app auth configured)
-                    if (-not $downloadSuccess -and $script:UseAppAuth -and $script:ClientSecret)
-                    {
-                        try
-                        {
-                            Write-ExportLog "  Attempting download with Purview eDiscovery token..."
-
-                            # Get token for Purview eDiscovery API
-                            $purviewResource = "b26e684c-5068-4120-a679-64a5d2c909d9"
-                            $tokenUrl = "https://login.microsoftonline.com/$($script:TenantId)/oauth2/v2.0/token"
-                            $tokenBody = @{
-                                client_id     = $script:AppId
-                                client_secret = $script:ClientSecret
-                                scope         = "$purviewResource/.default"
-                                grant_type    = "client_credentials"
-                            }
-
-                            $tokenResponse = Invoke-RestMethod -Uri $tokenUrl -Method POST -Body $tokenBody -ContentType "application/x-www-form-urlencoded"
-                            $purviewToken = $tokenResponse.access_token
-
-                            if ($purviewToken)
-                            {
-                                $headers = @{
-                                    "Authorization" = "Bearer $purviewToken"
-                                    "X-AllowWithAADToken" = "true"
-                                }
-
-                                Invoke-WebRequest -Uri $downloadUrl -OutFile $outputFile -Headers $headers -ErrorAction Stop
-
-                                # Verify it's a valid zip
-                                if (Test-Path $outputFile)
-                                {
-                                    $fileSize = (Get-Item $outputFile).Length
-                                    if ($fileSize -gt 1000)
-                                    {
-                                        $bytes = [System.IO.File]::ReadAllBytes($outputFile) | Select-Object -First 4
-                                        if ($bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B)
-                                        {
-                                            $downloadSuccess = $true
-                                            Write-ExportLog "  Purview token download succeeded (valid ZIP, $([math]::Round($fileSize/1MB, 2)) MB)"
-                                        }
-                                        else
-                                        {
-                                            Write-ExportLog "  Downloaded file is not a valid ZIP" -Level WARNING
-                                            Remove-Item $outputFile -Force -ErrorAction SilentlyContinue
-                                        }
-                                    }
-                                    else
-                                    {
-                                        $content = Get-Content $outputFile -Raw -ErrorAction SilentlyContinue
-                                        Write-ExportLog "  Downloaded file too small ($fileSize bytes)" -Level WARNING
-                                        Remove-Item $outputFile -Force -ErrorAction SilentlyContinue
-                                    }
-                                }
-                            }
-                        }
-                        catch
-                        {
-                            Write-ExportLog "  Purview token download failed: $($_.Exception.Message)" -Level WARNING
-                        }
-                    }
-
-                    # Method 2: Try direct download with WebRequest (for SAS URLs)
-                    if (-not $downloadSuccess)
-                    {
-                        try
-                        {
-                            Write-ExportLog "  Attempting direct WebRequest download..."
-                            Invoke-WebRequest -Uri $downloadUrl -OutFile $outputFile -ErrorAction Stop
-
-                            # Check if we got a valid zip
-                            if (Test-Path $outputFile)
-                            {
-                                $fileSize = (Get-Item $outputFile).Length
-                                if ($fileSize -gt 1000)
-                                {
-                                    $bytes = [System.IO.File]::ReadAllBytes($outputFile) | Select-Object -First 4
-                                    if ($bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B)
-                                    {
-                                        $downloadSuccess = $true
-                                        Write-ExportLog "  Direct download succeeded (valid ZIP, $fileSize bytes)"
-                                    }
-                                    else
-                                    {
-                                        Write-ExportLog "  Downloaded file is not a valid ZIP" -Level WARNING
-                                        Remove-Item $outputFile -Force -ErrorAction SilentlyContinue
-                                    }
-                                }
-                                else
-                                {
-                                    $content = Get-Content $outputFile -Raw -ErrorAction SilentlyContinue
-                                    Write-ExportLog "  Downloaded file too small ($fileSize bytes): $content" -Level WARNING
-                                    Remove-Item $outputFile -Force -ErrorAction SilentlyContinue
-                                }
-                            }
-                        }
-                        catch
-                        {
-                            Write-ExportLog "  Direct download failed: $($_.Exception.Message)" -Level WARNING
-                        }
-                    }
-
-                    # Method 3: Show URL for manual download
-                    if (-not $downloadSuccess)
-                    {
-                        Write-ExportLog "  Automated download failed. Download URL saved to log." -Level WARNING
-                        Write-ExportLog "  Manual download URL: $downloadUrl" -Level WARNING
-                        $result.ErrorMessage = "Automated download failed - use Purview portal or saved URL"
-                    }
-
-                    if ($downloadSuccess -and (Test-Path $outputFile))
-                    {
-                        $fileSize = (Get-Item $outputFile).Length
-                        $result.PstPath = $outputFile
-                        $result.PstSizeGB = [math]::Round($fileSize / 1GB, 2)
-                        $result.Status = "Completed"
-                        Write-ExportLog "  SUCCESS: $outputFile ($([math]::Round($fileSize / 1MB, 2)) MB)"
-                    }
-                    elseif (-not $downloadSuccess)
-                    {
-                        $result.Status = "DownloadFailed"
-                        if (-not $result.ErrorMessage)
-                        {
-                            $result.ErrorMessage = "All download methods failed - download manually from Purview portal"
-                        }
-                        Write-ExportLog "  Download failed - file available in Purview portal" -Level WARNING
-                    }
+                    $result.ErrorMessage = "One or more exports did not complete"
                 }
             }
             catch
             {
-                $result.Status = "DownloadFailed"
+                $result.Status = "ExportFailed"
                 $result.ErrorMessage = $_.Exception.Message
-                Write-ExportLog "  Download error: $($_.Exception.Message)" -Level ERROR
+                Write-ExportLog "  Export error: $($_.Exception.Message)" -Level ERROR
             }
         }
     }
@@ -1075,25 +1026,35 @@ try
     }
     #endregion
 
+        # Add batch results to all results
+        $allResults += $results
+
+        Write-ExportLog ""
+        Write-ExportLog "Batch $($batchNum + 1) complete."
+        Write-ExportLog ""
+    }
+    #endregion PROCESS EACH BATCH
+
     #region GENERATE SUMMARY REPORT
     Write-ExportLog ""
     Write-ExportLog "Generating summary report..."
 
-    $results | Export-Csv -Path $script:SummaryFile -NoTypeInformation
+    $allResults | Export-Csv -Path $script:SummaryFile -NoTypeInformation
 
     Write-ExportLog ""
     Write-ExportLog "============================================================"
     Write-ExportLog "EXPORT COMPLETE"
     Write-ExportLog "============================================================"
     Write-ExportLog ""
-    $totalCount = @($results).Count
-    $completedCount = @($results | Where-Object { $_.Status -eq 'Completed' -or $_.Status -eq 'ExportCreated' -or $_.Status -eq 'ExportStarted' }).Count
-    $failedCount = @($results | Where-Object { $_.Status -like '*Failed*' -or $_.Status -like '*Timeout*' }).Count
-    $pendingCount = @($results | Where-Object { $_.Status -eq 'Pending' -or $_.Status -eq 'SearchStarted' }).Count
+    $totalCount = @($allResults).Count
+    $readyCount = @($allResults | Where-Object { $_.Status -eq 'ReadyForDownload' -or $_.Status -eq 'ExportCreated' -or $_.Status -eq 'ExportStarted' }).Count
+    $failedCount = @($allResults | Where-Object { $_.Status -like '*Failed*' -or $_.Status -like '*Timeout*' }).Count
+    $pendingCount = @($allResults | Where-Object { $_.Status -eq 'Pending' -or $_.Status -eq 'SearchStarted' }).Count
 
     Write-ExportLog "Summary:"
     Write-ExportLog "  Total mailboxes: $totalCount"
-    Write-ExportLog "  Exports ready: $completedCount"
+    Write-ExportLog "  Total batches/cases: $($allCases.Count)"
+    Write-ExportLog "  Ready for download: $readyCount"
     Write-ExportLog "  Failed: $failedCount"
     Write-ExportLog "  Still pending: $pendingCount"
     Write-ExportLog ""
@@ -1105,25 +1066,40 @@ try
     Write-ExportLog "DOWNLOAD EXPORTS FROM PURVIEW"
     Write-ExportLog "============================================================"
     Write-ExportLog ""
-    Write-ExportLog "Case: $script:FullCaseName"
-    Write-ExportLog "Direct link: https://compliance.microsoft.com/contentsearchv2?caseId=$caseId&caseType=eDiscovery"
-    Write-ExportLog ""
 
-    # List all exports ready for download
-    $readyExports = @($results | Where-Object { $_.ExportId })
+    # List all cases with their download links
+    foreach ($caseInfo in $allCases)
+    {
+        Write-ExportLog "Case $($caseInfo.BatchNum): $($caseInfo.CaseName)"
+        Write-ExportLog "  Mailboxes: $($caseInfo.MailboxCount)"
+        Write-ExportLog "  Direct link: $($caseInfo.Url)"
+        Write-ExportLog ""
+    }
+
+    # List all exports ready for download grouped by case
+    $readyExports = @($allResults | Where-Object { $_.ExportId })
     if ($readyExports.Count -gt 0)
     {
-        Write-ExportLog "Exports ready for download ($($readyExports.Count)):"
+        Write-ExportLog "Exports ready for download ($($readyExports.Count) total):"
         Write-ExportLog ""
-        foreach ($export in $readyExports)
+
+        foreach ($caseInfo in $allCases)
         {
-            $exportCount = ($export.ExportId -split ";").Count
-            $exportLabel = if ($exportCount -gt 1) { "($exportCount parts)" } else { "" }
-            Write-ExportLog "  $($export.UPN) $exportLabel"
-            Write-ExportLog "    Size: $($export.ArchiveSizeGB) GB | Items: $($export.ItemCount)"
+            $caseExports = @($readyExports | Where-Object { $_.CaseId -eq $caseInfo.CaseId })
+            if ($caseExports.Count -gt 0)
+            {
+                Write-ExportLog "  --- $($caseInfo.CaseName) ---"
+                foreach ($export in $caseExports)
+                {
+                    $exportCount = ($export.ExportId -split ";").Count
+                    $exportLabel = if ($exportCount -gt 1) { "($exportCount parts)" } else { "" }
+                    Write-ExportLog "  $($export.UPN) $exportLabel - $($export.ArchiveSizeGB) GB"
+                }
+                Write-ExportLog ""
+            }
         }
-        Write-ExportLog ""
-        Write-ExportLog "To download: Open the Purview link above, click each export, then 'Download results'"
+
+        Write-ExportLog "To download: Open each case link above, click each export, then 'Download results'"
     }
     Write-ExportLog ""
     #endregion
