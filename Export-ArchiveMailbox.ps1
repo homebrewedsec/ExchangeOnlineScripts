@@ -823,20 +823,104 @@ try
                 {
                     $fileName = $file.fileName
                     $downloadUrl = $file.downloadUrl
-                    $outputFile = Join-Path $OutputPath "$($result.UPN -replace '@', '_at_')_$fileName"
 
-                    Write-ExportLog "  Downloading: $fileName"
+                    # Simplify the output filename
+                    $simpleFileName = if ($fileName -like "PSTs*") {
+                        "$($result.UPN -replace '@', '_at_').pst.zip"
+                    } else {
+                        "$($result.UPN -replace '@', '_at_')_report.zip"
+                    }
+                    $outputFile = Join-Path $OutputPath $simpleFileName
+
+                    Write-ExportLog "  Downloading: $fileName -> $simpleFileName"
+                    Write-ExportLog "  URL: $($downloadUrl.Substring(0, [Math]::Min(100, $downloadUrl.Length)))..."
 
                     $downloadSuccess = $false
 
-                    # Method 1: Try direct download (SAS URLs include auth in the URL)
+                    # Get access token from Graph context for authenticated downloads
+                    $accessToken = $null
+                    try
+                    {
+                        # Use Invoke-MgGraphRequest to verify Graph connection is active
+                        $null = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/me" -Method GET -OutputType HttpResponseMessage
+                        # Extract token from the MgContext after making a request
+                        $context = Get-MgContext
+                        if ($context)
+                        {
+                            # The token isn't directly accessible, but we can use Invoke-MgGraphRequest for downloads
+                            $accessToken = "USE_GRAPH_REQUEST"
+                        }
+                    }
+                    catch
+                    {
+                        Write-ExportLog "  Could not get access token: $($_.Exception.Message)" -Level WARNING
+                    }
+
+                    # Method 1: Try using Invoke-MgGraphRequest (uses existing auth)
+                    if (-not $downloadSuccess -and $accessToken -eq "USE_GRAPH_REQUEST")
+                    {
+                        try
+                        {
+                            Write-ExportLog "  Attempting download via Graph request..."
+                            # eDiscovery download URLs may need to go through Graph
+                            Invoke-MgGraphRequest -Uri $downloadUrl -Method GET -OutputFilePath $outputFile -ErrorAction Stop
+
+                            # Verify it's a valid zip (check magic bytes)
+                            if (Test-Path $outputFile)
+                            {
+                                $bytes = [System.IO.File]::ReadAllBytes($outputFile) | Select-Object -First 4
+                                if ($bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B)
+                                {
+                                    $downloadSuccess = $true
+                                    Write-ExportLog "  Graph request download succeeded (valid ZIP)"
+                                }
+                                else
+                                {
+                                    $content = Get-Content $outputFile -Raw -ErrorAction SilentlyContinue
+                                    Write-ExportLog "  Graph request returned non-ZIP content: $($content.Substring(0, [Math]::Min(200, $content.Length)))" -Level WARNING
+                                    Remove-Item $outputFile -Force -ErrorAction SilentlyContinue
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            Write-ExportLog "  Graph request download failed: $($_.Exception.Message)" -Level WARNING
+                        }
+                    }
+
+                    # Method 2: Try direct download with WebRequest (for SAS URLs)
                     if (-not $downloadSuccess)
                     {
                         try
                         {
-                            Write-ExportLog "  Attempting direct download..."
+                            Write-ExportLog "  Attempting direct WebRequest download..."
                             Invoke-WebRequest -Uri $downloadUrl -OutFile $outputFile -ErrorAction Stop
-                            $downloadSuccess = $true
+
+                            # Check if we got a valid zip
+                            if (Test-Path $outputFile)
+                            {
+                                $fileSize = (Get-Item $outputFile).Length
+                                if ($fileSize -gt 1000)
+                                {
+                                    $bytes = [System.IO.File]::ReadAllBytes($outputFile) | Select-Object -First 4
+                                    if ($bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B)
+                                    {
+                                        $downloadSuccess = $true
+                                        Write-ExportLog "  Direct download succeeded (valid ZIP, $fileSize bytes)"
+                                    }
+                                    else
+                                    {
+                                        Write-ExportLog "  Downloaded file is not a valid ZIP" -Level WARNING
+                                        Remove-Item $outputFile -Force -ErrorAction SilentlyContinue
+                                    }
+                                }
+                                else
+                                {
+                                    $content = Get-Content $outputFile -Raw -ErrorAction SilentlyContinue
+                                    Write-ExportLog "  Downloaded file too small ($fileSize bytes): $content" -Level WARNING
+                                    Remove-Item $outputFile -Force -ErrorAction SilentlyContinue
+                                }
+                            }
                         }
                         catch
                         {
@@ -844,51 +928,12 @@ try
                         }
                     }
 
-                    # Method 2: Try with Graph token
+                    # Method 3: Show URL for manual download
                     if (-not $downloadSuccess)
                     {
-                        try
-                        {
-                            Write-ExportLog "  Attempting download with Graph token..."
-                            $graphToken = (Get-MgContext).AccessToken
-                            if (-not $graphToken)
-                            {
-                                # Get token via Graph context
-                                $graphToken = Invoke-MgGraphRequest -Uri "/v1.0/me" -OutputType HttpResponseMessage | Out-Null
-                                $graphToken = (Get-MgContext).AccessToken
-                            }
-
-                            if ($graphToken)
-                            {
-                                $headers = @{
-                                    "Authorization" = "Bearer $graphToken"
-                                }
-                                Invoke-WebRequest -Uri $downloadUrl -OutFile $outputFile -Headers $headers -ErrorAction Stop
-                                $downloadSuccess = $true
-                            }
-                        }
-                        catch
-                        {
-                            Write-ExportLog "  Graph token download failed: $($_.Exception.Message)" -Level WARNING
-                        }
-                    }
-
-                    # Method 3: Try with eDiscovery-specific headers
-                    if (-not $downloadSuccess)
-                    {
-                        try
-                        {
-                            Write-ExportLog "  Attempting download with eDiscovery headers..."
-                            $headers = @{
-                                "X-AllowWithAADToken" = "true"
-                            }
-                            Invoke-WebRequest -Uri $downloadUrl -OutFile $outputFile -Headers $headers -UseDefaultCredentials -ErrorAction Stop
-                            $downloadSuccess = $true
-                        }
-                        catch
-                        {
-                            Write-ExportLog "  eDiscovery header download failed: $($_.Exception.Message)" -Level WARNING
-                        }
+                        Write-ExportLog "  Automated download failed. Download URL saved to log." -Level WARNING
+                        Write-ExportLog "  Manual download URL: $downloadUrl" -Level WARNING
+                        $result.ErrorMessage = "Automated download failed - use Purview portal or saved URL"
                     }
 
                     if ($downloadSuccess -and (Test-Path $outputFile))
@@ -897,12 +942,15 @@ try
                         $result.PstPath = $outputFile
                         $result.PstSizeGB = [math]::Round($fileSize / 1GB, 2)
                         $result.Status = "Completed"
-                        Write-ExportLog "  Downloaded: $outputFile ($($result.PstSizeGB) GB)"
+                        Write-ExportLog "  SUCCESS: $outputFile ($([math]::Round($fileSize / 1MB, 2)) MB)"
                     }
-                    else
+                    elseif (-not $downloadSuccess)
                     {
                         $result.Status = "DownloadFailed"
-                        $result.ErrorMessage = "All download methods failed - download manually from Purview portal"
+                        if (-not $result.ErrorMessage)
+                        {
+                            $result.ErrorMessage = "All download methods failed - download manually from Purview portal"
+                        }
                         Write-ExportLog "  Download failed - file available in Purview portal" -Level WARNING
                     }
                 }
