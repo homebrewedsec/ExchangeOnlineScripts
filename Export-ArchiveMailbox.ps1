@@ -630,7 +630,7 @@ try
             Write-Log "  Added data source: $upn"
 
             # Start search estimate
-            Invoke-MgBetaEstimateSecurityCaseEdiscoveryCaseSearchStatistics -EdiscoveryCaseId $caseId -EdiscoverySearchId $search.Id | Out-Null
+            Invoke-MgEstimateSecurityCaseEdiscoveryCaseSearchStatistics -EdiscoveryCaseId $caseId -EdiscoverySearchId $search.Id | Out-Null
 
             Write-Log "  Started search estimate"
 
@@ -657,7 +657,7 @@ try
                 exportLocation    = "responsiveLocations"
             }
 
-            $null = Export-MgBetaSecurityCaseEdiscoveryCaseSearchResult -EdiscoveryCaseId $caseId -EdiscoverySearchId $search.Id -BodyParameter $exportParams
+            $null = Export-MgSecurityCaseEdiscoveryCaseSearchResult -EdiscoveryCaseId $caseId -EdiscoverySearchId $search.Id -BodyParameter $exportParams
 
             # Get the operation ID from the response
             $operations = Get-MgSecurityCaseEdiscoveryCaseOperation -EdiscoveryCaseId $caseId |
@@ -717,13 +717,35 @@ try
         }
         else
         {
-            Write-Log "Interactive download token acquisition..."
-            Import-Module MSAL.PS
-
-            $tokenResult = Get-MsalToken -ClientId "b26e684c-5068-4120-a679-64a5d2c909d9" -Scopes "eDiscovery.Download.Read" -Interactive
-            $downloadToken = $tokenResult.AccessToken
+            # Interactive mode - automated download requires app registration
+            # Direct user to download from Purview portal instead
+            Write-Log ""
+            Write-Log "============================================================" -Level WARNING
+            Write-Log "INTERACTIVE MODE: Manual download required" -Level WARNING
+            Write-Log "============================================================" -Level WARNING
+            Write-Log "Automated PST download requires app registration with" -Level WARNING
+            Write-Log "eDiscovery.Download.Read permission." -Level WARNING
+            Write-Log "" -Level WARNING
+            Write-Log "Download your PST files from:" -Level WARNING
+            Write-Log "  https://compliance.microsoft.com/ediscovery" -Level WARNING
+            Write-Log "" -Level WARNING
+            Write-Log "Look for case: $script:FullCaseName" -Level WARNING
+            Write-Log "============================================================" -Level WARNING
+            Write-Log ""
+            $SkipDownload = $true
         }
 
+        # Check if download was disabled due to token failure
+        if ($SkipDownload -or -not $downloadToken)
+        {
+            Write-Log "Download skipped - exports available in Purview portal"
+            foreach ($result in $results | Where-Object { $_.ExportId })
+            {
+                $result.Status = "ExportCreated"
+            }
+        }
+        else
+        {
         foreach ($result in $results | Where-Object { $_.ExportId })
         {
             Write-Log "Waiting for export: $($result.UPN)..."
@@ -785,6 +807,7 @@ try
                 Write-Log "  Download error: $($_.Exception.Message)" -Level ERROR
             }
         }
+        } # End of download else block
     }
     else
     {
