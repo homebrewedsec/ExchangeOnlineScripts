@@ -38,7 +38,13 @@
 
 .PARAMETER CertificateThumbprint
     Certificate thumbprint for app-only authentication.
-    Required when using AppId.
+    Required when using AppId with certificate auth.
+
+.PARAMETER ClientSecret
+    Client secret for app-only authentication.
+    Alternative to CertificateThumbprint. Required for automated PST downloads.
+    App registration needs eDiscovery.ReadWrite.All (Graph) and permissions on
+    MicrosoftPurviewEDiscovery (b26e684c-5068-4120-a679-64a5d2c909d9) for downloads.
 
 .PARAMETER SkipDownload
     Create searches and exports only, skip PST download.
@@ -54,7 +60,11 @@
 
 .EXAMPLE
     .\Export-ArchiveMailbox.ps1 -InputCsvPath "mailboxes.csv" -AppId "app-id" -TenantId "tenant-id" -CertificateThumbprint "thumbprint"
-    Exports using app-only authentication for unattended operation.
+    Exports using certificate-based app authentication.
+
+.EXAMPLE
+    .\Export-ArchiveMailbox.ps1 -InputCsvPath "mailboxes.csv" -AppId "app-id" -TenantId "tenant-id" -ClientSecret "secret"
+    Exports using client secret authentication with automated PST downloads.
 
 .EXAMPLE
     .\Export-ArchiveMailbox.ps1 -InputCsvPath "mailboxes.csv" -SkipDownload
@@ -90,6 +100,8 @@ param(
     [string]$TenantId,
 
     [string]$CertificateThumbprint,
+
+    [string]$ClientSecret,
 
     [switch]$SkipDownload
 )
@@ -451,19 +463,22 @@ try
     Write-ExportLog "Connecting to services..."
 
     # Determine authentication mode
-    $useAppAuth = $AppId -and $TenantId -and $CertificateThumbprint
+    $useCertAuth = $AppId -and $TenantId -and $CertificateThumbprint
+    $useSecretAuth = $AppId -and $TenantId -and $ClientSecret
+    $useAppAuth = $useCertAuth -or $useSecretAuth
 
     # Connect to Exchange Online
     $exoSession = Get-ConnectionInformation -ErrorAction SilentlyContinue
     if (-not $exoSession -or $exoSession.State -ne "Connected")
     {
         Write-ExportLog "Connecting to Exchange Online..."
-        if ($useAppAuth)
+        if ($useCertAuth)
         {
             Connect-ExchangeOnline -AppId $AppId -CertificateThumbprint $CertificateThumbprint -Organization "$TenantId.onmicrosoft.com" -ShowBanner:$false
         }
         else
         {
+            # Interactive or existing session for Exchange (client secret not supported for EXO)
             Connect-ExchangeOnline -ShowBanner:$false
         }
     }
@@ -477,8 +492,16 @@ try
     if (-not $graphContext)
     {
         Write-ExportLog "Connecting to Microsoft Graph..."
-        if ($useAppAuth)
+        if ($useSecretAuth)
         {
+            # Client secret authentication
+            $secureSecret = ConvertTo-SecureString -String $ClientSecret -AsPlainText -Force
+            $credential = New-Object System.Management.Automation.PSCredential($AppId, $secureSecret)
+            Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $credential
+        }
+        elseif ($useCertAuth)
+        {
+            # Certificate authentication
             $cert = Get-ChildItem "Cert:\CurrentUser\My\$CertificateThumbprint" -ErrorAction SilentlyContinue
             if (-not $cert)
             {
@@ -492,6 +515,7 @@ try
         }
         else
         {
+            # Interactive authentication
             Connect-MgGraph -Scopes "eDiscovery.ReadWrite.All"
         }
     }
@@ -499,6 +523,13 @@ try
     {
         Write-ExportLog "Using existing Microsoft Graph session"
     }
+
+    # Store credentials for download phase if using app auth
+    $script:UseAppAuth = $useAppAuth
+    $script:AppId = $AppId
+    $script:TenantId = $TenantId
+    $script:ClientSecret = $ClientSecret
+    $script:CertificateThumbprint = $CertificateThumbprint
 
     Write-ExportLog "Connected to all services"
     Write-ExportLog ""
@@ -884,67 +915,78 @@ try
                     $fileName = $file.fileName
                     $downloadUrl = $file.downloadUrl
 
-                    # Simplify the output filename
+                    # Simplify the output filename - handle multiple parts
+                    $partMatch = if ($fileName -match "Part(\d+)") { "_Part$($matches[1])" } else { "" }
                     $simpleFileName = if ($fileName -like "PSTs*") {
-                        "$($result.UPN -replace '@', '_at_').pst.zip"
+                        "$($result.UPN -replace '@', '_at_')$partMatch.pst.zip"
                     } else {
-                        "$($result.UPN -replace '@', '_at_')_report.zip"
+                        "$($result.UPN -replace '@', '_at_')$partMatch_report.zip"
                     }
                     $outputFile = Join-Path $OutputPath $simpleFileName
 
                     Write-ExportLog "  Downloading: $fileName -> $simpleFileName"
-                    Write-ExportLog "  URL: $($downloadUrl.Substring(0, [Math]::Min(100, $downloadUrl.Length)))..."
 
                     $downloadSuccess = $false
 
-                    # Get access token from Graph context for authenticated downloads
-                    $accessToken = $null
-                    try
-                    {
-                        # Use Invoke-MgGraphRequest to verify Graph connection is active
-                        $null = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/me" -Method GET -OutputType HttpResponseMessage
-                        # Extract token from the MgContext after making a request
-                        $context = Get-MgContext
-                        if ($context)
-                        {
-                            # The token isn't directly accessible, but we can use Invoke-MgGraphRequest for downloads
-                            $accessToken = "USE_GRAPH_REQUEST"
-                        }
-                    }
-                    catch
-                    {
-                        Write-ExportLog "  Could not get access token: $($_.Exception.Message)" -Level WARNING
-                    }
-
-                    # Method 1: Try using Invoke-MgGraphRequest (uses existing auth)
-                    if (-not $downloadSuccess -and $accessToken -eq "USE_GRAPH_REQUEST")
+                    # Method 1: Try with Purview eDiscovery token (if app auth configured)
+                    if (-not $downloadSuccess -and $script:UseAppAuth -and $script:ClientSecret)
                     {
                         try
                         {
-                            Write-ExportLog "  Attempting download via Graph request..."
-                            # eDiscovery download URLs may need to go through Graph
-                            Invoke-MgGraphRequest -Uri $downloadUrl -Method GET -OutputFilePath $outputFile -ErrorAction Stop
+                            Write-ExportLog "  Attempting download with Purview eDiscovery token..."
 
-                            # Verify it's a valid zip (check magic bytes)
-                            if (Test-Path $outputFile)
+                            # Get token for Purview eDiscovery API
+                            $purviewResource = "b26e684c-5068-4120-a679-64a5d2c909d9"
+                            $tokenUrl = "https://login.microsoftonline.com/$($script:TenantId)/oauth2/v2.0/token"
+                            $tokenBody = @{
+                                client_id     = $script:AppId
+                                client_secret = $script:ClientSecret
+                                scope         = "$purviewResource/.default"
+                                grant_type    = "client_credentials"
+                            }
+
+                            $tokenResponse = Invoke-RestMethod -Uri $tokenUrl -Method POST -Body $tokenBody -ContentType "application/x-www-form-urlencoded"
+                            $purviewToken = $tokenResponse.access_token
+
+                            if ($purviewToken)
                             {
-                                $bytes = [System.IO.File]::ReadAllBytes($outputFile) | Select-Object -First 4
-                                if ($bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B)
-                                {
-                                    $downloadSuccess = $true
-                                    Write-ExportLog "  Graph request download succeeded (valid ZIP)"
+                                $headers = @{
+                                    "Authorization" = "Bearer $purviewToken"
+                                    "X-AllowWithAADToken" = "true"
                                 }
-                                else
+
+                                Invoke-WebRequest -Uri $downloadUrl -OutFile $outputFile -Headers $headers -ErrorAction Stop
+
+                                # Verify it's a valid zip
+                                if (Test-Path $outputFile)
                                 {
-                                    $content = Get-Content $outputFile -Raw -ErrorAction SilentlyContinue
-                                    Write-ExportLog "  Graph request returned non-ZIP content: $($content.Substring(0, [Math]::Min(200, $content.Length)))" -Level WARNING
-                                    Remove-Item $outputFile -Force -ErrorAction SilentlyContinue
+                                    $fileSize = (Get-Item $outputFile).Length
+                                    if ($fileSize -gt 1000)
+                                    {
+                                        $bytes = [System.IO.File]::ReadAllBytes($outputFile) | Select-Object -First 4
+                                        if ($bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B)
+                                        {
+                                            $downloadSuccess = $true
+                                            Write-ExportLog "  Purview token download succeeded (valid ZIP, $([math]::Round($fileSize/1MB, 2)) MB)"
+                                        }
+                                        else
+                                        {
+                                            Write-ExportLog "  Downloaded file is not a valid ZIP" -Level WARNING
+                                            Remove-Item $outputFile -Force -ErrorAction SilentlyContinue
+                                        }
+                                    }
+                                    else
+                                    {
+                                        $content = Get-Content $outputFile -Raw -ErrorAction SilentlyContinue
+                                        Write-ExportLog "  Downloaded file too small ($fileSize bytes)" -Level WARNING
+                                        Remove-Item $outputFile -Force -ErrorAction SilentlyContinue
+                                    }
                                 }
                             }
                         }
                         catch
                         {
-                            Write-ExportLog "  Graph request download failed: $($_.Exception.Message)" -Level WARNING
+                            Write-ExportLog "  Purview token download failed: $($_.Exception.Message)" -Level WARNING
                         }
                     }
 
