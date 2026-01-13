@@ -62,14 +62,13 @@
 
 .NOTES
     Author: Hudson Bush, Seguri - hudson@seguri.io
-    Requires: ExchangeOnlineManagement, Microsoft.Graph, MSAL.PS modules
+    Requires: ExchangeOnlineManagement, Microsoft.Graph modules
     Roles Required: eDiscovery Manager (Purview), Exchange Administrator
 
     Prerequisites:
     - For interactive auth: User with eDiscovery Manager role
     - For app-only auth: Azure AD app registration with:
       - Microsoft Graph: eDiscovery.ReadWrite.All (Application)
-      - MicrosoftPurviewEDiscovery: eDiscovery.Download.Read (Application)
 
     Reference Documentation:
     - https://learn.microsoft.com/en-us/purview/edisc-ref-api-guide
@@ -404,14 +403,6 @@ try
         if (-not (Get-Module -Name $module -ListAvailable))
         {
             throw "Required module not found: $module. Install with: Install-Module $module"
-        }
-    }
-
-    if (-not $SkipDownload)
-    {
-        if (-not (Get-Module -Name "MSAL.PS" -ListAvailable))
-        {
-            throw "MSAL.PS module required for PST download. Install with: Install-Module MSAL.PS"
         }
     }
 
@@ -797,61 +788,8 @@ try
     #region WAIT FOR EXPORTS AND DOWNLOAD
     if (-not $SkipDownload)
     {
-        Write-ExportLog "Downloading PST files..."
+        Write-ExportLog "Waiting for exports to complete and downloading PST files..."
 
-        # Get MSAL token for download
-        $downloadToken = $null
-
-        if ($useAppAuth)
-        {
-            Import-Module MSAL.PS
-
-            $cert = Get-ChildItem "Cert:\CurrentUser\My\$CertificateThumbprint" -ErrorAction SilentlyContinue
-            if (-not $cert)
-            {
-                $cert = Get-ChildItem "Cert:\LocalMachine\My\$CertificateThumbprint" -ErrorAction SilentlyContinue
-            }
-
-            $tokenParams = @{
-                ClientId            = $AppId
-                TenantId            = $TenantId
-                ClientCertificate   = $cert
-                Scopes              = "b26e684c-5068-4120-a679-64a5d2c909d9/.default"
-            }
-            $tokenResult = Get-MsalToken @tokenParams
-            $downloadToken = $tokenResult.AccessToken
-        }
-        else
-        {
-            # Interactive mode - automated download requires app registration
-            # Direct user to download from Purview portal instead
-            Write-ExportLog ""
-            Write-ExportLog "============================================================" -Level WARNING
-            Write-ExportLog "INTERACTIVE MODE: Manual download required" -Level WARNING
-            Write-ExportLog "============================================================" -Level WARNING
-            Write-ExportLog "Automated PST download requires app registration with" -Level WARNING
-            Write-ExportLog "eDiscovery.Download.Read permission." -Level WARNING
-            Write-ExportLog "" -Level WARNING
-            Write-ExportLog "Download your PST files from:" -Level WARNING
-            Write-ExportLog "  https://compliance.microsoft.com/ediscovery" -Level WARNING
-            Write-ExportLog "" -Level WARNING
-            Write-ExportLog "Look for case: $script:FullCaseName" -Level WARNING
-            Write-ExportLog "============================================================" -Level WARNING
-            Write-ExportLog ""
-            $SkipDownload = $true
-        }
-
-        # Check if download was disabled due to token failure
-        if ($SkipDownload -or -not $downloadToken)
-        {
-            Write-ExportLog "Download skipped - exports available in Purview portal"
-            foreach ($result in $results | Where-Object { $_.ExportId })
-            {
-                $result.Status = "ExportCreated"
-            }
-        }
-        else
-        {
         foreach ($result in $results | Where-Object { $_.ExportId })
         {
             Write-ExportLog "Waiting for export: $($result.UPN)..."
@@ -880,7 +818,7 @@ try
                     continue
                 }
 
-                # Download each file
+                # Download each file - try multiple methods
                 foreach ($file in $fileMetadata)
                 {
                     $fileName = $file.fileName
@@ -889,20 +827,83 @@ try
 
                     Write-ExportLog "  Downloading: $fileName"
 
-                    $headers = @{
-                        "Authorization"      = "Bearer $downloadToken"
-                        "X-AllowWithAADToken" = "true"
+                    $downloadSuccess = $false
+
+                    # Method 1: Try direct download (SAS URLs include auth in the URL)
+                    if (-not $downloadSuccess)
+                    {
+                        try
+                        {
+                            Write-ExportLog "  Attempting direct download..."
+                            Invoke-WebRequest -Uri $downloadUrl -OutFile $outputFile -ErrorAction Stop
+                            $downloadSuccess = $true
+                        }
+                        catch
+                        {
+                            Write-ExportLog "  Direct download failed: $($_.Exception.Message)" -Level WARNING
+                        }
                     }
 
-                    Invoke-WebRequest -Uri $downloadUrl -OutFile $outputFile -Headers $headers
+                    # Method 2: Try with Graph token
+                    if (-not $downloadSuccess)
+                    {
+                        try
+                        {
+                            Write-ExportLog "  Attempting download with Graph token..."
+                            $graphToken = (Get-MgContext).AccessToken
+                            if (-not $graphToken)
+                            {
+                                # Get token via Graph context
+                                $graphToken = Invoke-MgGraphRequest -Uri "/v1.0/me" -OutputType HttpResponseMessage | Out-Null
+                                $graphToken = (Get-MgContext).AccessToken
+                            }
 
-                    if (Test-Path $outputFile)
+                            if ($graphToken)
+                            {
+                                $headers = @{
+                                    "Authorization" = "Bearer $graphToken"
+                                }
+                                Invoke-WebRequest -Uri $downloadUrl -OutFile $outputFile -Headers $headers -ErrorAction Stop
+                                $downloadSuccess = $true
+                            }
+                        }
+                        catch
+                        {
+                            Write-ExportLog "  Graph token download failed: $($_.Exception.Message)" -Level WARNING
+                        }
+                    }
+
+                    # Method 3: Try with eDiscovery-specific headers
+                    if (-not $downloadSuccess)
+                    {
+                        try
+                        {
+                            Write-ExportLog "  Attempting download with eDiscovery headers..."
+                            $headers = @{
+                                "X-AllowWithAADToken" = "true"
+                            }
+                            Invoke-WebRequest -Uri $downloadUrl -OutFile $outputFile -Headers $headers -UseDefaultCredentials -ErrorAction Stop
+                            $downloadSuccess = $true
+                        }
+                        catch
+                        {
+                            Write-ExportLog "  eDiscovery header download failed: $($_.Exception.Message)" -Level WARNING
+                        }
+                    }
+
+                    if ($downloadSuccess -and (Test-Path $outputFile))
                     {
                         $fileSize = (Get-Item $outputFile).Length
                         $result.PstPath = $outputFile
                         $result.PstSizeGB = [math]::Round($fileSize / 1GB, 2)
                         $result.Status = "Completed"
                         Write-ExportLog "  Downloaded: $outputFile ($($result.PstSizeGB) GB)"
+                    }
+                    else
+                    {
+                        $result.Status = "DownloadFailed"
+                        $result.ErrorMessage = "All download methods failed - download manually from Purview portal"
+                        Write-ExportLog "  Download failed - file available in Purview portal" -Level WARNING
                     }
                 }
             }
@@ -913,7 +914,6 @@ try
                 Write-ExportLog "  Download error: $($_.Exception.Message)" -Level ERROR
             }
         }
-        } # End of download else block
     }
     else
     {
