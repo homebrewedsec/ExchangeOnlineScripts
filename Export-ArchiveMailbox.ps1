@@ -132,12 +132,12 @@ function Write-Log
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = "[$timestamp] [$Level] $Message"
 
-    # Write to console
+    # Write to console (use Write-Host to avoid polluting pipeline/return values)
     switch ($Level)
     {
         "WARNING" { Write-Warning $Message }
         "ERROR" { Write-Error $Message }
-        default { Write-Output $Message }
+        default { Write-Host $Message }
     }
 
     # Write to log file
