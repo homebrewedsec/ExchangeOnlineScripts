@@ -623,6 +623,7 @@ try
             SearchId         = $null
             SearchName       = $null
             ExportId         = $null
+            ExportUrl        = $null
             PstPath          = $null
             PstSizeGB        = $null
             Status           = "Pending"
@@ -808,7 +809,10 @@ try
                     }
 
                     $result.ExportId = $exportIds -join ";"
+                    # Build direct Purview portal URL for easy access
+                    $result.ExportUrl = "https://compliance.microsoft.com/contentsearchv2?caseId=$caseId&caseType=eDiscovery"
                     $result.Status = "ExportStarted"
+                    Write-ExportLog "  Purview URL: $($result.ExportUrl)"
                 }
                 # If not all complete and none failed - keep waiting (status is "running", "notStarted", etc.)
             }
@@ -1052,12 +1056,33 @@ try
     Write-ExportLog "  Still pending: $pendingCount"
     Write-ExportLog ""
     Write-ExportLog "Output files:"
-    Write-ExportLog "  Summary: $script:SummaryFile"
-    Write-ExportLog "  Log: $script:LogFile"
-    Write-ExportLog "  PST files: $OutputPath"
+    Write-ExportLog "  Summary CSV: $script:SummaryFile"
+    Write-ExportLog "  Log file: $script:LogFile"
     Write-ExportLog ""
-    Write-ExportLog "eDiscovery Case: $script:FullCaseName (ID: $caseId)"
-    Write-ExportLog "  View in Purview: https://compliance.microsoft.com/ediscovery"
+    Write-ExportLog "============================================================"
+    Write-ExportLog "DOWNLOAD EXPORTS FROM PURVIEW"
+    Write-ExportLog "============================================================"
+    Write-ExportLog ""
+    Write-ExportLog "Case: $script:FullCaseName"
+    Write-ExportLog "Direct link: https://compliance.microsoft.com/contentsearchv2?caseId=$caseId&caseType=eDiscovery"
+    Write-ExportLog ""
+
+    # List all exports ready for download
+    $readyExports = @($results | Where-Object { $_.ExportId })
+    if ($readyExports.Count -gt 0)
+    {
+        Write-ExportLog "Exports ready for download ($($readyExports.Count)):"
+        Write-ExportLog ""
+        foreach ($export in $readyExports)
+        {
+            $exportCount = ($export.ExportId -split ";").Count
+            $exportLabel = if ($exportCount -gt 1) { "($exportCount parts)" } else { "" }
+            Write-ExportLog "  $($export.UPN) $exportLabel"
+            Write-ExportLog "    Size: $($export.ArchiveSizeGB) GB | Items: $($export.ItemCount)"
+        }
+        Write-ExportLog ""
+        Write-ExportLog "To download: Open the Purview link above, click each export, then 'Download results'"
+    }
     Write-ExportLog ""
     #endregion
 }
