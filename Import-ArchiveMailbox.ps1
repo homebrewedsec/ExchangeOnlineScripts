@@ -34,8 +34,7 @@
 
 .PARAMETER FilePath
     Value for the FilePath column in the Purview mapping CSV.
-    This should match the folder name in Azure blob storage.
-    Default: "Batch1"
+    Default: Derived from ZipFolderPath (e.g., "X:\ZIPs\Batch2" -> "Batch2")
 
 .PARAMETER AzureSasUrl
     Optional. Azure Blob Storage SAS URL from Purview portal.
@@ -90,7 +89,7 @@ param(
     [string]$OutputPath = (Get-Location).Path,
 
     [Parameter(Mandatory = $false)]
-    [string]$FilePath = "Batch1",
+    [string]$FilePath,
 
     [Parameter(Mandatory = $false)]
     [string]$AzureSasUrl,
@@ -114,6 +113,13 @@ if (-not (Test-Path $ZipFolderPath))
 {
     Write-Error "ZIP folder not found: $ZipFolderPath"
     exit 1
+}
+
+# Derive FilePath from ZipFolderPath if not specified
+if (-not $FilePath)
+{
+    $FilePath = Split-Path -Path $ZipFolderPath -Leaf
+    Write-Output "FilePath derived from folder: $FilePath"
 }
 
 # Check if mapping CSV exists
