@@ -128,14 +128,23 @@ $script:Results = @{
 function Write-Log
 {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message,
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$Message = "",
 
         [ValidateSet("INFO", "WARNING", "ERROR", "DEBUG", "SUCCESS")]
         [string]$Level = "INFO",
 
         [string]$Method = "GENERAL"
     )
+
+    # Handle empty messages (used for spacing)
+    if ([string]::IsNullOrEmpty($Message))
+    {
+        Write-Host ""
+        Add-Content -Path $script:LogFile -Value "" -ErrorAction SilentlyContinue
+        return
+    }
 
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
     $logEntry = "[$timestamp] [$Method] [$Level] $Message"
