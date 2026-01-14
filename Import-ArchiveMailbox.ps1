@@ -29,13 +29,13 @@
     Required columns: SourceEmail (or SourceUPN), TargetEmail (or TargetUPN)
 
 .PARAMETER OutputPath
-    Directory where PSTs will be extracted to batch subfolder.
+    Directory where PSTs will be extracted.
     Default: Current directory
 
-.PARAMETER BatchName
-    Name of the batch subfolder for organizing PSTs.
+.PARAMETER FilePath
+    Value for the FilePath column in the Purview mapping CSV.
+    This should match the folder name in Azure blob storage.
     Default: "Batch1"
-    This becomes the FilePath value in the Purview mapping.
 
 .PARAMETER AzureSasUrl
     Optional. Azure Blob Storage SAS URL from Purview portal.
@@ -47,12 +47,12 @@
 .EXAMPLE
     .\Import-ArchiveMailbox.ps1 -ZipFolderPath "C:\ZIPs" -MappingCsvPath "mapping.csv"
 
-    Extracts ZIPs to Batch1 subfolder and generates Purview mapping CSV.
+    Extracts ZIPs to current directory and generates Purview mapping CSV.
 
 .EXAMPLE
-    .\Import-ArchiveMailbox.ps1 -ZipFolderPath "C:\ZIPs" -MappingCsvPath "mapping.csv" -BatchName "Batch2"
+    .\Import-ArchiveMailbox.ps1 -ZipFolderPath "C:\ZIPs" -MappingCsvPath "mapping.csv" -OutputPath "C:\PSTs" -FilePath "Batch2"
 
-    Uses custom batch folder name.
+    Extracts to C:\PSTs, uses "Batch2" as the FilePath in Purview mapping.
 
 .EXAMPLE
     .\Import-ArchiveMailbox.ps1 -ZipFolderPath "C:\ZIPs" -MappingCsvPath "mapping.csv" -AzureSasUrl "https://..."
@@ -90,7 +90,7 @@ param(
     [string]$OutputPath = (Get-Location).Path,
 
     [Parameter(Mandatory = $false)]
-    [string]$BatchName = "Batch1",
+    [string]$FilePath = "Batch1",
 
     [Parameter(Mandatory = $false)]
     [string]$AzureSasUrl,
@@ -123,12 +123,11 @@ if (-not (Test-Path $MappingCsvPath))
     exit 1
 }
 
-# Create batch subfolder
-$batchFolder = Join-Path $OutputPath $BatchName
-if (-not (Test-Path $batchFolder))
+# Create output directory if it doesn't exist
+if (-not (Test-Path $OutputPath))
 {
-    Write-Output "Creating batch folder: $batchFolder"
-    New-Item -ItemType Directory -Path $batchFolder -Force | Out-Null
+    Write-Output "Creating output folder: $OutputPath"
+    New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
 }
 
 # Load and validate mapping CSV
@@ -203,6 +202,33 @@ if (-not $azcopyPath)
     Write-Output ""
 }
 
+# Check for 7-Zip (preferred for extraction - handles more formats)
+$sevenZipPath = $null
+$sevenZipLocations = @(
+    "C:\Program Files\7-Zip\7z.exe",
+    "C:\Program Files (x86)\7-Zip\7z.exe",
+    (Get-Command 7z -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
+)
+foreach ($loc in $sevenZipLocations)
+{
+    if ($loc -and (Test-Path $loc))
+    {
+        $sevenZipPath = $loc
+        break
+    }
+}
+
+if ($sevenZipPath)
+{
+    Write-Output "Using 7-Zip for extraction: $sevenZipPath"
+}
+else
+{
+    Write-Warning "7-Zip not found. Using Expand-Archive (may fail on some ZIP formats)."
+    Write-Warning "Install 7-Zip for better compatibility: https://www.7-zip.org/"
+}
+
+Write-Output ""
 Write-Output "Validation complete."
 Write-Output ""
 #endregion
@@ -221,7 +247,8 @@ if ($zipFiles.Count -eq 0)
 }
 
 Write-Output "Found $($zipFiles.Count) ZIP files."
-Write-Output "Batch folder: $batchFolder"
+Write-Output "Output folder: $OutputPath"
+Write-Output "Purview FilePath: $FilePath"
 Write-Output ""
 
 # Regex to extract email from filename
@@ -278,48 +305,103 @@ foreach ($zip in $zipFiles)
     Write-Output "  - Source: $sourceEmail"
     Write-Output "  - Target: $targetEmail"
 
-    # Extract ZIP to a temp location first, then rename and move PST
+    # Extract ZIP to a temp location first, then rename and move PSTs
     try
     {
         # Create temp extraction folder
-        $tempExtractPath = Join-Path $batchFolder "_temp_extract"
+        $tempExtractPath = Join-Path $OutputPath "_temp_extract"
         if (Test-Path $tempExtractPath)
         {
             Remove-Item $tempExtractPath -Recurse -Force
         }
         New-Item -ItemType Directory -Path $tempExtractPath -Force | Out-Null
 
-        # Extract ZIP
-        Expand-Archive -Path $zip.FullName -DestinationPath $tempExtractPath -Force
-
-        # Look for exchange.pst (or any .pst) in the extracted content
-        $extractedPst = Get-ChildItem -Path $tempExtractPath -Filter "*.pst" -Recurse | Select-Object -First 1
-
-        if ($extractedPst)
+        # Extract ZIP using 7-Zip (preferred) or Expand-Archive (fallback)
+        $extractionSuccess = $false
+        if ($sevenZipPath)
         {
-            # Target PST name matches the ZIP filename
-            $targetPstName = $zip.BaseName + ".pst"
-            $targetPstPath = Join-Path $batchFolder $targetPstName
-
-            # Move and rename the PST
-            Move-Item -Path $extractedPst.FullName -Destination $targetPstPath -Force
-
-            $pstFile = Get-Item $targetPstPath
-            $sizeGB = [math]::Round($pstFile.Length / 1GB, 2)
-            Write-Output "  - Extracted and renamed: $($extractedPst.Name) -> $targetPstName ($sizeGB GB)"
-
-            $extractedPsts += [PSCustomObject]@{
-                SourceEmail = $sourceEmail
-                TargetEmail = $targetEmail
-                PstName     = $targetPstName
-                PstPath     = $targetPstPath
-                SizeGB      = $sizeGB
+            # Use 7-Zip - more robust for large/complex ZIPs
+            $sevenZipArgs = @('x', "-o$tempExtractPath", '-y', $zip.FullName)
+            & $sevenZipPath @sevenZipArgs 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0)
+            {
+                $extractionSuccess = $true
+            }
+            else
+            {
+                Write-Warning "  - 7-Zip extraction failed, trying Expand-Archive..."
+                try
+                {
+                    Expand-Archive -Path $zip.FullName -DestinationPath $tempExtractPath -Force
+                    $extractionSuccess = $true
+                }
+                catch
+                {
+                    Write-Warning "  - Expand-Archive also failed: $_"
+                }
             }
         }
         else
         {
-            Write-Warning "  - No PST file found in ZIP"
+            # No 7-Zip, use Expand-Archive
+            Expand-Archive -Path $zip.FullName -DestinationPath $tempExtractPath -Force
+            $extractionSuccess = $true
+        }
+
+        if (-not $extractionSuccess)
+        {
+            Write-Warning "  - All extraction methods failed"
             $failedExtractions += $zip.Name
+            if (Test-Path $tempExtractPath) { Remove-Item $tempExtractPath -Recurse -Force -ErrorAction SilentlyContinue }
+            Write-Output ""
+            continue
+        }
+
+        # Look for all PST files in the extracted content (handles Exchange.001.pst, Exchange.002.pst, etc.)
+        $allPsts = Get-ChildItem -Path $tempExtractPath -Filter "*.pst" -Recurse
+
+        if ($allPsts.Count -eq 0)
+        {
+            Write-Warning "  - No PST files found in ZIP"
+            $failedExtractions += $zip.Name
+        }
+        else
+        {
+            # Get base name for the PSTs (strip _Part1, _Part2 suffixes if present)
+            $basePstName = $zip.BaseName -replace '_Part\d+$', ''
+
+            $pstIndex = 0
+            foreach ($extractedPst in $allPsts)
+            {
+                # Generate unique PST name
+                if ($allPsts.Count -eq 1)
+                {
+                    $targetPstName = "$basePstName.pst"
+                }
+                else
+                {
+                    # Multiple PSTs - append .001, .002, etc.
+                    $pstIndex++
+                    $targetPstName = "$basePstName.$($pstIndex.ToString('000')).pst"
+                }
+
+                $targetPstPath = Join-Path $OutputPath $targetPstName
+
+                # Move and rename the PST
+                Move-Item -Path $extractedPst.FullName -Destination $targetPstPath -Force
+
+                $pstFile = Get-Item $targetPstPath
+                $sizeGB = [math]::Round($pstFile.Length / 1GB, 2)
+                Write-Output "  - Extracted: $($extractedPst.Name) -> $targetPstName ($sizeGB GB)"
+
+                $extractedPsts += [PSCustomObject]@{
+                    SourceEmail = $sourceEmail
+                    TargetEmail = $targetEmail
+                    PstName     = $targetPstName
+                    PstPath     = $targetPstPath
+                    SizeGB      = $sizeGB
+                }
+            }
         }
 
         # Clean up temp folder
@@ -334,6 +416,7 @@ foreach ($zip in $zipFiles)
         $failedExtractions += $zip.Name
 
         # Clean up temp folder on error
+        $tempExtractPath = Join-Path $OutputPath "_temp_extract"
         if (Test-Path $tempExtractPath)
         {
             Remove-Item $tempExtractPath -Recurse -Force -ErrorAction SilentlyContinue
@@ -367,7 +450,7 @@ foreach ($pst in $extractedPsts)
 {
     $purviewMapping += [PSCustomObject]@{
         Workload            = "Exchange"
-        FilePath            = $BatchName
+        FilePath            = $FilePath
         Name                = $pst.PstName
         Mailbox             = $pst.TargetEmail
         IsArchive           = "TRUE"
@@ -408,13 +491,13 @@ if ($RunUpload -and $AzureSasUrl)
         exit 1
     }
 
-    Write-Output "Running: azcopy.exe copy `"$batchFolder`" `"<SAS_URL>`" --recursive=true"
+    Write-Output "Running: azcopy.exe copy `"$OutputPath`" `"<SAS_URL>`" --recursive=true"
     Write-Output ""
 
     try
     {
         # Execute AzCopy
-        $azcopyResult = & azcopy.exe copy "$batchFolder" "$AzureSasUrl" --recursive=true 2>&1
+        $azcopyResult = & azcopy.exe copy "$OutputPath" "$AzureSasUrl" --recursive=true 2>&1
 
         # Output the result
         $azcopyResult | ForEach-Object { Write-Output $_ }
@@ -450,7 +533,8 @@ $totalSizeGB = ($extractedPsts | Measure-Object -Property SizeGB -Sum).Sum
 Write-Output "Summary:"
 Write-Output "  - PSTs prepared: $($extractedPsts.Count)"
 Write-Output "  - Total size: $([math]::Round($totalSizeGB, 2)) GB"
-Write-Output "  - Batch folder: $batchFolder"
+Write-Output "  - Output folder: $OutputPath"
+Write-Output "  - Purview FilePath: $FilePath"
 Write-Output "  - Mapping CSV: $purviewCsvPath"
 if ($RunUpload -and $AzureSasUrl)
 {
@@ -506,7 +590,7 @@ else
     {
         Write-Output "2. Run AzCopy to upload PSTs:"
         Write-Output ""
-        Write-Output "   azcopy.exe copy `"$batchFolder`" `"$AzureSasUrl`" --recursive=true"
+        Write-Output "   azcopy.exe copy `"$OutputPath`" `"$AzureSasUrl`" --recursive=true"
         Write-Output ""
         Write-Output "   Or re-run this script with -RunUpload to execute automatically"
         Write-Output ""
@@ -515,7 +599,7 @@ else
     {
         Write-Output "2. Run AzCopy to upload PSTs:"
         Write-Output ""
-        Write-Output "   azcopy.exe copy `"$batchFolder`" `"<SAS_URL_FROM_PURVIEW>`" --recursive=true"
+        Write-Output "   azcopy.exe copy `"$OutputPath`" `"<SAS_URL_FROM_PURVIEW>`" --recursive=true"
         Write-Output ""
         Write-Output "   Or re-run with: -AzureSasUrl `"<SAS_URL>`" -RunUpload"
         Write-Output ""
