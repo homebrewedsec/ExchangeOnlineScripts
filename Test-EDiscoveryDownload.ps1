@@ -25,6 +25,10 @@
 .PARAMETER OutputPath
     Directory for downloads and logs. Defaults to current directory.
 
+.PARAMETER ClientId
+    Your Azure AD app registration client ID that has eDiscovery.Download.Read delegated permission.
+    If not provided, falls back to Azure PowerShell's client ID (which may not have the permission).
+
 .PARAMETER DownloadToken
     Pre-captured bearer token for downloads. Use this for fully automated runs.
     Capture from browser dev tools when downloading from Purview portal.
@@ -32,6 +36,10 @@
 
 .PARAMETER SkipMethods
     Array of method numbers to skip (e.g., 1,2,3). Useful for targeted testing.
+
+.EXAMPLE
+    .\Test-EDiscoveryDownload.ps1 -CaseName "ArchiveExport" -ClientId "c0c284d2-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    Tests downloads using your app registration with eDiscovery.Download.Read permission.
 
 .EXAMPLE
     .\Test-EDiscoveryDownload.ps1 -CaseName "ArchiveExport"
@@ -75,6 +83,9 @@ param(
     [string]$ExportOperationId,
 
     [string]$OutputPath = (Get-Location).Path,
+
+    # Your Azure AD app registration client ID that has eDiscovery.Download.Read delegated permission
+    [string]$ClientId,
 
     [string]$DownloadToken,
 
@@ -704,9 +715,18 @@ function Get-PurviewDownloadToken
         }
     }
 
-    # Azure PowerShell client ID - supports delegated permissions
-    $clientId = "1950a258-227b-4e31-a9cf-717495945fc2"
-    Write-Log "  Using ClientId: $clientId (Azure PowerShell)" -Method "TOKEN"
+    # Use provided ClientId or fall back to Azure PowerShell default
+    $clientIdToUse = if ($ClientId) { $ClientId } else { "1950a258-227b-4e31-a9cf-717495945fc2" }
+
+    if ($ClientId)
+    {
+        Write-Log "  Using ClientId: $clientIdToUse (your app registration with eDiscovery.Download.Read)" -Method "TOKEN"
+    }
+    else
+    {
+        Write-Log "  Using ClientId: $clientIdToUse (Azure PowerShell default)" -Level WARNING -Method "TOKEN"
+        Write-Log "  TIP: Pass -ClientId with your app registration ID that has eDiscovery.Download.Read" -Level WARNING -Method "TOKEN"
+    }
 
     $token = $null
 
@@ -739,7 +759,7 @@ function Get-PurviewDownloadToken
         $authority = "https://login.microsoftonline.com/$tenantIdToUse"
         Write-Log "  Authority: $authority" -Method "TOKEN"
 
-        $publicClientBuilder = [Microsoft.Identity.Client.PublicClientApplicationBuilder]::Create($clientId)
+        $publicClientBuilder = [Microsoft.Identity.Client.PublicClientApplicationBuilder]::Create($clientIdToUse)
         $publicClientBuilder = $publicClientBuilder.WithAuthority($authority)
         $publicClientBuilder = $publicClientBuilder.WithDefaultRedirectUri()
         $publicClient = $publicClientBuilder.Build()
@@ -789,7 +809,7 @@ function Get-PurviewDownloadToken
             $scopes.Add($script:PurviewScope)
 
             $authority = "https://login.microsoftonline.com/$tenantIdToUse"
-            $publicClientBuilder = [Microsoft.Identity.Client.PublicClientApplicationBuilder]::Create($clientId)
+            $publicClientBuilder = [Microsoft.Identity.Client.PublicClientApplicationBuilder]::Create($clientIdToUse)
             $publicClientBuilder = $publicClientBuilder.WithAuthority($authority)
             $publicClientBuilder = $publicClientBuilder.WithDefaultRedirectUri()
             $publicClient = $publicClientBuilder.Build()
@@ -819,7 +839,7 @@ function Get-PurviewDownloadToken
                 Write-Log "  MSAL.PS module loaded" -Level DEBUG -Method "TOKEN"
 
                 # Try device code flow with direct parameters
-                $msalToken = Get-MsalToken -ClientId $clientId -TenantId $tenantIdToUse -Scopes @($script:PurviewScope) -DeviceCode -ErrorAction Stop
+                $msalToken = Get-MsalToken -ClientId $clientIdToUse -TenantId $tenantIdToUse -Scopes @($script:PurviewScope) -DeviceCode -ErrorAction Stop
 
                 if ($msalToken -and $msalToken.AccessToken)
                 {
