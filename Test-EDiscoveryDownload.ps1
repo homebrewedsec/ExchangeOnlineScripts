@@ -881,66 +881,50 @@ function Get-PurviewDownloadToken
     }
 
     if ($token -and $token.AccessToken)
-        {
-            Write-Log "Token acquired successfully" -Level SUCCESS -Method "TOKEN"
-            Write-Log "  Token length: $($token.AccessToken.Length) characters" -Method "TOKEN"
-            Write-Log "  ExpiresOn: $($token.ExpiresOn)" -Method "TOKEN"
-
-            # Decode and log token claims (without exposing full token)
-            try
-            {
-                $tokenParts = $token.AccessToken -split '\.'
-                if ($tokenParts.Count -ge 2)
-                {
-                    $payload = $tokenParts[1]
-                    # Add padding if needed
-                    $padding = 4 - ($payload.Length % 4)
-                    if ($padding -lt 4) { $payload += "=" * $padding }
-                    $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
-
-                    Write-Log "Token claims:" -Method "TOKEN"
-                    Write-Log "  aud (audience): $($decoded.aud)" -Method "TOKEN"
-                    Write-Log "  iss (issuer): $($decoded.iss)" -Method "TOKEN"
-                    Write-Log "  scp (scopes): $($decoded.scp)" -Method "TOKEN"
-                    Write-Log "  upn (user): $($decoded.upn)" -Method "TOKEN"
-
-                    $tokenResult.Audience = $decoded.aud
-                    $tokenResult.Scopes = $decoded.scp
-                }
-            }
-            catch
-            {
-                Write-Log "Could not decode token claims: $($_.Exception.Message)" -Level WARNING -Method "TOKEN"
-            }
-
-            $tokenResult.Success = $true
-            $tokenResult.Method = "MSAL.PS Interactive"
-            $tokenResult.AccessToken = $token.AccessToken
-            $tokenResult.ExpiresOn = $token.ExpiresOn.ToString()
-
-            # Store for use by download methods
-            $script:PurviewToken = $token.AccessToken
-        }
-        else
-        {
-            Write-Log "Token acquisition returned empty token" -Level ERROR -Method "TOKEN"
-            $tokenResult.Error = "Token acquisition returned empty token"
-        }
-    }
-    catch
     {
-        Write-Log "Token acquisition failed: $($_.Exception.Message)" -Level ERROR -Method "TOKEN"
-        Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level DEBUG -Method "TOKEN"
-        $tokenResult.Error = $_.Exception.Message
+        Write-Log "Token acquired successfully" -Level SUCCESS -Method "TOKEN"
+        Write-Log "  Token length: $($token.AccessToken.Length) characters" -Method "TOKEN"
+        Write-Log "  ExpiresOn: $($token.ExpiresOn)" -Method "TOKEN"
 
-        # Common error guidance
-        if ($_.Exception.Message -match "AADSTS")
+        # Decode and log token claims (without exposing full token)
+        try
         {
-            Write-Log "This appears to be an Azure AD error. Common causes:" -Level WARNING -Method "TOKEN"
-            Write-Log "  - App registration doesn't have eDiscovery.Download.Read permission" -Level WARNING -Method "TOKEN"
-            Write-Log "  - Admin consent not granted for the permission" -Level WARNING -Method "TOKEN"
-            Write-Log "  - MicrosoftPurviewEDiscovery service principal not in tenant" -Level WARNING -Method "TOKEN"
+            $tokenParts = $token.AccessToken -split '\.'
+            if ($tokenParts.Count -ge 2)
+            {
+                $payload = $tokenParts[1]
+                # Add padding if needed
+                $padding = 4 - ($payload.Length % 4)
+                if ($padding -lt 4) { $payload += "=" * $padding }
+                $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+
+                Write-Log "Token claims:" -Method "TOKEN"
+                Write-Log "  aud (audience): $($decoded.aud)" -Method "TOKEN"
+                Write-Log "  iss (issuer): $($decoded.iss)" -Method "TOKEN"
+                Write-Log "  scp (scopes): $($decoded.scp)" -Method "TOKEN"
+                Write-Log "  upn (user): $($decoded.upn)" -Method "TOKEN"
+
+                $tokenResult.Audience = $decoded.aud
+                $tokenResult.Scopes = $decoded.scp
+            }
         }
+        catch
+        {
+            Write-Log "Could not decode token claims: $($_.Exception.Message)" -Level WARNING -Method "TOKEN"
+        }
+
+        $tokenResult.Success = $true
+        # Method is already set by the specific acquisition method that succeeded
+        $tokenResult.AccessToken = $token.AccessToken
+        $tokenResult.ExpiresOn = $token.ExpiresOn.ToString()
+
+        # Store for use by download methods
+        $script:PurviewToken = $token.AccessToken
+    }
+    else
+    {
+        Write-Log "Token acquisition returned empty token" -Level ERROR -Method "TOKEN"
+        $tokenResult.Error = "Token acquisition returned empty token"
     }
 
     $script:Results.Methods.TokenAcquisition = $tokenResult
