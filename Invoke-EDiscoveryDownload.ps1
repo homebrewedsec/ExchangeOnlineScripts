@@ -326,40 +326,43 @@ try
         if (-not $msalAssembly)
         {
             Write-Log "  Loading MSAL.NET assembly..."
+            Write-Log "  PowerShell version: $($PSVersionTable.PSVersion)"
 
-            # Search multiple locations for Microsoft.Identity.Client.dll
+            # Search for Microsoft.Identity.Client.dll in MSAL.PS module
             $msalModule = Get-Module -Name MSAL.PS -ListAvailable | Select-Object -First 1
-            $searchPaths = @(
-                (Join-Path $msalModule.ModuleBase "Microsoft.Identity.Client.dll")
-                (Join-Path $msalModule.ModuleBase "net45\Microsoft.Identity.Client.dll")
-                (Join-Path $msalModule.ModuleBase "netcoreapp2.1\Microsoft.Identity.Client.dll")
-                (Join-Path $msalModule.ModuleBase "lib\net45\Microsoft.Identity.Client.dll")
-                (Join-Path $msalModule.ModuleBase "lib\netstandard2.0\Microsoft.Identity.Client.dll")
-            )
-
-            # Also search recursively in module directory
             $foundDlls = Get-ChildItem -Path $msalModule.ModuleBase -Filter "Microsoft.Identity.Client.dll" -Recurse -ErrorAction SilentlyContinue
-            foreach ($dll in $foundDlls)
+
+            # Sort DLLs: prefer netcore/netstandard for PS7+, net45 for Windows PowerShell
+            $isPSCore = $PSVersionTable.PSVersion.Major -ge 6
+            if ($isPSCore)
             {
-                $searchPaths += $dll.FullName
+                # PS7+ needs netcore or netstandard
+                $sortedDlls = $foundDlls | Sort-Object {
+                    if ($_.FullName -match 'netcoreapp|netstandard|net6|net7|net8') { 0 } else { 1 }
+                }
+            }
+            else
+            {
+                # Windows PowerShell needs net45/net461
+                $sortedDlls = $foundDlls | Sort-Object {
+                    if ($_.FullName -match 'net4') { 0 } else { 1 }
+                }
             }
 
             $loaded = $false
-            foreach ($path in $searchPaths | Select-Object -Unique)
+            foreach ($dll in $sortedDlls)
             {
-                if (Test-Path $path)
+                Write-Log "  Trying: $($dll.FullName)"
+                try
                 {
-                    Write-Log "  Found MSAL.NET at: $path"
-                    try
-                    {
-                        Add-Type -Path $path -ErrorAction Stop
-                        $loaded = $true
-                        break
-                    }
-                    catch
-                    {
-                        Write-Log "  Could not load from $path : $($_.Exception.Message)" -Level WARNING
-                    }
+                    Add-Type -Path $dll.FullName -ErrorAction Stop
+                    Write-Log "  Loaded MSAL.NET successfully" -Level SUCCESS
+                    $loaded = $true
+                    break
+                }
+                catch
+                {
+                    Write-Log "  Could not load: $($_.Exception.Message)" -Level WARNING
                 }
             }
 
