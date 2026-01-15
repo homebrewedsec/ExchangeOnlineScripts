@@ -37,20 +37,25 @@
 .PARAMETER ClientSecret
     Client secret for app authentication to Graph.
 
+.PARAMETER DownloadToken
+    Pre-captured bearer token for downloads. Use this for fully automated runs.
+    Capture from browser dev tools when downloading from Purview portal.
+    NOTE: Tokens expire after ~1 hour.
+
 .PARAMETER SkipMethods
     Array of method numbers to skip (e.g., 1,2,3). Useful for targeted testing.
 
 .EXAMPLE
-    .\Test-EDiscoveryDownload.ps1 -CaseName "ArchiveExport"
-    Tests all download methods for a case matching "ArchiveExport" using default app registration.
+    .\Test-EDiscoveryDownload.ps1 -CaseName "ArchiveExport" -AppId "xxx" -TenantId "yyy" -ClientSecret "zzz"
+    Uses client secret for Graph API, then prompts for device code auth for downloads.
 
 .EXAMPLE
-    .\Test-EDiscoveryDownload.ps1 -CaseName "ArchiveExport" -ClientSecret "your-secret"
-    Uses client secret authentication for Graph operations.
+    .\Test-EDiscoveryDownload.ps1 -CaseId "abc123-def456" -AppId "xxx" -TenantId "yyy" -ClientSecret "zzz"
+    Tests downloads for specific case ID with app auth for Graph operations.
 
 .EXAMPLE
-    .\Test-EDiscoveryDownload.ps1 -CaseId "abc123-def456-etc"
-    Tests all download methods for the specified case ID using certificate auth (default).
+    .\Test-EDiscoveryDownload.ps1 -CaseName "MyCase" -DownloadToken "eyJ0eXAiOiJKV1Q..."
+    Uses a pre-captured token for fully automated downloads (no interactive auth).
 
 .EXAMPLE
     .\Test-EDiscoveryDownload.ps1 -CaseName "MyCase" -SkipMethods 5,6
@@ -90,6 +95,8 @@ param(
     [string]$CertificateThumbprint,
 
     [string]$ClientSecret,
+
+    [string]$DownloadToken,
 
     [int[]]$SkipMethods = @()
 )
@@ -274,9 +281,12 @@ function Connect-ToGraph
         Error = $null
     }
 
-    # Check existing connection
+    # Determine auth method
+    $useAppAuth = ($AppId -and $TenantId) -and ($CertificateThumbprint -or $ClientSecret)
+
+    # Check existing connection - but if app auth requested, reconnect with app credentials
     $existingContext = Get-MgContext -ErrorAction SilentlyContinue
-    if ($existingContext)
+    if ($existingContext -and -not $useAppAuth)
     {
         Write-Log "Using existing Graph connection" -Level SUCCESS -Method "GRAPH"
         Write-Log "  Account: $($existingContext.Account)" -Method "GRAPH"
@@ -291,9 +301,11 @@ function Connect-ToGraph
         }
         return $connectionResult
     }
-
-    # Determine auth method
-    $useAppAuth = ($AppId -and $TenantId) -and ($CertificateThumbprint -or $ClientSecret)
+    elseif ($existingContext -and $useAppAuth)
+    {
+        Write-Log "Disconnecting existing session to use app authentication..." -Method "GRAPH"
+        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+    }
 
     try
     {
@@ -727,25 +739,49 @@ function Get-PurviewDownloadToken
     Write-Log "Acquiring token for MicrosoftPurviewEDiscovery..." -Method "TOKEN"
     Write-Log "  Resource ID: $script:PurviewResourceId" -Method "TOKEN"
     Write-Log "  Scope: $script:PurviewScope" -Method "TOKEN"
-    Write-Log "NOTE: This requires INTERACTIVE authentication (delegated permissions only)" -Level WARNING -Method "TOKEN"
+
+    # Check if pre-captured token was provided
+    if ($DownloadToken)
+    {
+        Write-Log "Using pre-captured download token" -Level SUCCESS -Method "TOKEN"
+        Write-Log "  Token length: $($DownloadToken.Length) characters" -Method "TOKEN"
+
+        $script:PurviewToken = $DownloadToken
+        $tokenResult.Success = $true
+        $tokenResult.Method = "Pre-captured"
+        $tokenResult.AccessToken = $DownloadToken
+
+        $script:Results.Methods.TokenAcquisition = $tokenResult
+        return $tokenResult
+    }
+
+    Write-Log "NOTE: Microsoft only supports DELEGATED permissions for downloads" -Level WARNING -Method "TOKEN"
+    Write-Log "      App-only authentication CANNOT work - this is a Microsoft limitation" -Level WARNING -Method "TOKEN"
 
     try
     {
-        # Determine client ID to use
-        $clientId = if ($AppId) { $AppId } else { "1950a258-227b-4e31-a9cf-717495945fc2" }  # Azure PowerShell default
-        Write-Log "  Using ClientId: $clientId" -Method "TOKEN"
+        # Determine client ID to use - for delegated auth, use Azure PowerShell default
+        # The app registration's client ID won't work unless it has delegated permissions configured
+        $clientId = "1950a258-227b-4e31-a9cf-717495945fc2"  # Azure PowerShell default - has delegated permissions
+        Write-Log "  Using ClientId: $clientId (Azure PowerShell - supports delegated auth)" -Method "TOKEN"
 
-        $tokenParams = @{
-            ClientId    = $clientId
-            TenantId    = $script:TenantId
-            Scopes      = @($script:PurviewScope)
-            Interactive = $true
+        # Try device code flow first (works better for scripts/servers)
+        Write-Log "Attempting device code flow authentication..." -Method "TOKEN"
+        Write-Log "This will display a code - enter it at https://microsoft.com/devicelogin" -Level WARNING -Method "TOKEN"
+
+        $token = $null
+        try
+        {
+            $token = Get-MsalToken -ClientId $clientId -TenantId $script:TenantId -Scopes @($script:PurviewScope) -DeviceCode -ErrorAction Stop
         }
+        catch
+        {
+            Write-Log "Device code flow failed: $($_.Exception.Message)" -Level WARNING -Method "TOKEN"
+            Write-Log "Falling back to interactive browser authentication..." -Method "TOKEN"
 
-        Write-Log "Requesting interactive token..." -Method "TOKEN"
-        Write-Log "A browser window should open for authentication" -Level WARNING -Method "TOKEN"
-
-        $token = Get-MsalToken @tokenParams -ErrorAction Stop
+            # Fallback to interactive
+            $token = Get-MsalToken -ClientId $clientId -TenantId $script:TenantId -Scopes @($script:PurviewScope) -Interactive -ErrorAction Stop
+        }
 
         if ($token -and $token.AccessToken)
         {
@@ -1523,7 +1559,7 @@ function Test-NetworkDiagnostics
         try
         {
             # Just test connectivity, not auth
-            $response = Invoke-WebRequest -Uri $endpoint.Url -Method HEAD -TimeoutSec 10 -ErrorAction Stop
+            $response = Invoke-WebRequest -Uri $endpoint.Url -Method HEAD -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
             Write-Log "    Reachable: StatusCode $($response.StatusCode)" -Level SUCCESS -Method "NETWORK"
             $endpointResult.Reachable = $true
             $endpointResult.StatusCode = $response.StatusCode
