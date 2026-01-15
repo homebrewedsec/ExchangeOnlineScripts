@@ -653,7 +653,7 @@ function Get-ExportMetadata
 #region MSAL TOKEN ACQUISITION
 function Get-PurviewDownloadToken
 {
-    Write-LogSection "PHASE 4: MSAL TOKEN ACQUISITION"
+    Write-LogSection "PHASE 4: TOKEN ACQUISITION"
 
     $tokenResult = @{
         Success = $false
@@ -663,20 +663,6 @@ function Get-PurviewDownloadToken
         Audience = $null
         Scopes = $null
         Error = $null
-    }
-
-    # Import MSAL.PS
-    try
-    {
-        Import-Module MSAL.PS -ErrorAction Stop
-        Write-Log "MSAL.PS module loaded" -Level SUCCESS -Method "TOKEN"
-    }
-    catch
-    {
-        Write-Log "Failed to import MSAL.PS: $($_.Exception.Message)" -Level ERROR -Method "TOKEN"
-        $tokenResult.Error = "Failed to import MSAL.PS module"
-        $script:Results.Methods.TokenAcquisition = $tokenResult
-        return $tokenResult
     }
 
     Write-Log "Acquiring token for MicrosoftPurviewEDiscovery..." -Method "TOKEN"
@@ -701,69 +687,200 @@ function Get-PurviewDownloadToken
     Write-Log "NOTE: Microsoft only supports DELEGATED permissions for downloads" -Level WARNING -Method "TOKEN"
     Write-Log "      App-only authentication CANNOT work - this is a Microsoft limitation" -Level WARNING -Method "TOKEN"
 
+    # Get tenant ID from Graph context
+    $tenantIdToUse = $script:TenantId
+    if (-not $tenantIdToUse)
+    {
+        $graphContext = Get-MgContext -ErrorAction SilentlyContinue
+        if ($graphContext -and $graphContext.TenantId)
+        {
+            $tenantIdToUse = $graphContext.TenantId
+            Write-Log "  Using TenantId from Graph context: $tenantIdToUse" -Method "TOKEN"
+        }
+        else
+        {
+            Write-Log "  No TenantId available - will use common endpoint" -Level WARNING -Method "TOKEN"
+            $tenantIdToUse = "common"
+        }
+    }
+
+    # Azure PowerShell client ID - supports delegated permissions
+    $clientId = "1950a258-227b-4e31-a9cf-717495945fc2"
+    Write-Log "  Using ClientId: $clientId (Azure PowerShell)" -Method "TOKEN"
+
+    $token = $null
+
+    # Method 1: Try using raw MSAL.NET directly (bypasses buggy MSAL.PS wrapper)
+    Write-Log "Method 1: Using raw MSAL.NET assembly..." -Method "TOKEN"
     try
     {
-        # Determine client ID to use - for delegated auth, use Azure PowerShell default
-        $clientId = "1950a258-227b-4e31-a9cf-717495945fc2"  # Azure PowerShell default - has delegated permissions
-        Write-Log "  Using ClientId: $clientId (Azure PowerShell - supports delegated auth)" -Method "TOKEN"
-
-        # Get tenant ID from Graph context if not provided
-        $tenantIdToUse = $script:TenantId
-        if (-not $tenantIdToUse)
+        # Find and load Microsoft.Identity.Client assembly from MSAL.PS module
+        $msalModule = Get-Module -Name MSAL.PS -ListAvailable | Select-Object -First 1
+        if ($msalModule)
         {
-            $graphContext = Get-MgContext -ErrorAction SilentlyContinue
-            if ($graphContext -and $graphContext.TenantId)
+            $msalPath = Join-Path $msalModule.ModuleBase "Microsoft.Identity.Client.dll"
+            if (Test-Path $msalPath)
             {
-                $tenantIdToUse = $graphContext.TenantId
-                Write-Log "  Using TenantId from Graph context: $tenantIdToUse" -Method "TOKEN"
-            }
-            else
-            {
-                Write-Log "  No TenantId available - will use common endpoint" -Level WARNING -Method "TOKEN"
-                $tenantIdToUse = "common"
+                Add-Type -Path $msalPath -ErrorAction SilentlyContinue
+                Write-Log "  Loaded MSAL.NET from: $msalPath" -Level DEBUG -Method "TOKEN"
             }
         }
 
-        # Try device code flow first (works better for scripts/servers)
-        # Use direct parameter passing instead of piping - fixes MSAL.PS compatibility issues
-        Write-Log "Attempting device code flow authentication..." -Method "TOKEN"
-        Write-Log "This will display a code - enter it at https://microsoft.com/devicelogin" -Level WARNING -Method "TOKEN"
+        # Check if assembly is loaded
+        $msalAssembly = [System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq "Microsoft.Identity.Client" }
+        if (-not $msalAssembly)
+        {
+            throw "Microsoft.Identity.Client assembly not found"
+        }
 
-        $token = $null
+        Write-Log "  MSAL.NET assembly loaded" -Level SUCCESS -Method "TOKEN"
+
+        # Build public client application
+        $authority = "https://login.microsoftonline.com/$tenantIdToUse"
+        Write-Log "  Authority: $authority" -Method "TOKEN"
+
+        $publicClientBuilder = [Microsoft.Identity.Client.PublicClientApplicationBuilder]::Create($clientId)
+        $publicClientBuilder = $publicClientBuilder.WithAuthority($authority)
+        $publicClientBuilder = $publicClientBuilder.WithDefaultRedirectUri()
+        $publicClient = $publicClientBuilder.Build()
+
+        Write-Log "  Public client application created" -Level DEBUG -Method "TOKEN"
+
+        # Try device code flow
+        Write-Log "Attempting device code flow..." -Method "TOKEN"
+        Write-Log "Watch for a device code to enter at https://microsoft.com/devicelogin" -Level WARNING -Method "TOKEN"
+
+        $scopes = [System.Collections.Generic.List[string]]::new()
+        $scopes.Add($script:PurviewScope)
+
+        $deviceCodeCallback = [Microsoft.Identity.Client.Func[Microsoft.Identity.Client.DeviceCodeResult, System.Threading.Tasks.Task]] {
+            param($deviceCodeResult)
+            Write-Log "" -Method "TOKEN"
+            Write-Log "========================================" -Level WARNING -Method "TOKEN"
+            Write-Log $deviceCodeResult.Message -Level WARNING -Method "TOKEN"
+            Write-Log "========================================" -Level WARNING -Method "TOKEN"
+            Write-Log "" -Method "TOKEN"
+            return [System.Threading.Tasks.Task]::CompletedTask
+        }
+
+        $tokenRequest = $publicClient.AcquireTokenWithDeviceCode($scopes, $deviceCodeCallback)
+        $authResult = $tokenRequest.ExecuteAsync().GetAwaiter().GetResult()
+
+        if ($authResult -and $authResult.AccessToken)
+        {
+            $token = @{
+                AccessToken = $authResult.AccessToken
+                ExpiresOn = $authResult.ExpiresOn
+            }
+            Write-Log "Device code authentication successful!" -Level SUCCESS -Method "TOKEN"
+            $tokenResult.Method = "MSAL.NET DeviceCode"
+        }
+    }
+    catch
+    {
+        Write-Log "MSAL.NET device code failed: $($_.Exception.Message)" -Level WARNING -Method "TOKEN"
+        Write-Log "  Exception type: $($_.Exception.GetType().FullName)" -Level DEBUG -Method "TOKEN"
+
+        # Method 2: Try interactive browser flow
+        Write-Log "Method 2: Trying interactive browser flow..." -Method "TOKEN"
         try
         {
-            # Direct call to Get-MsalToken with all parameters (no piping)
-            $token = Get-MsalToken -ClientId $clientId -TenantId $tenantIdToUse -Scopes @($script:PurviewScope) -DeviceCode -ErrorAction Stop
+            $scopes = [System.Collections.Generic.List[string]]::new()
+            $scopes.Add($script:PurviewScope)
+
+            $authority = "https://login.microsoftonline.com/$tenantIdToUse"
+            $publicClientBuilder = [Microsoft.Identity.Client.PublicClientApplicationBuilder]::Create($clientId)
+            $publicClientBuilder = $publicClientBuilder.WithAuthority($authority)
+            $publicClientBuilder = $publicClientBuilder.WithDefaultRedirectUri()
+            $publicClient = $publicClientBuilder.Build()
+
+            $tokenRequest = $publicClient.AcquireTokenInteractive($scopes)
+            $authResult = $tokenRequest.ExecuteAsync().GetAwaiter().GetResult()
+
+            if ($authResult -and $authResult.AccessToken)
+            {
+                $token = @{
+                    AccessToken = $authResult.AccessToken
+                    ExpiresOn = $authResult.ExpiresOn
+                }
+                Write-Log "Interactive authentication successful!" -Level SUCCESS -Method "TOKEN"
+                $tokenResult.Method = "MSAL.NET Interactive"
+            }
         }
         catch
         {
-            Write-Log "Device code flow failed: $($_.Exception.Message)" -Level WARNING -Method "TOKEN"
-            Write-Log "Falling back to interactive browser authentication..." -Method "TOKEN"
+            Write-Log "Interactive flow failed: $($_.Exception.Message)" -Level WARNING -Method "TOKEN"
 
-            # Fallback to interactive - also use direct parameter passing
+            # Method 3: Try MSAL.PS wrapper (may work in some environments)
+            Write-Log "Method 3: Trying MSAL.PS Get-MsalToken wrapper..." -Method "TOKEN"
             try
             {
-                $token = Get-MsalToken -ClientId $clientId -TenantId $tenantIdToUse -Scopes @($script:PurviewScope) -Interactive -ErrorAction Stop
+                Import-Module MSAL.PS -ErrorAction Stop
+                Write-Log "  MSAL.PS module loaded" -Level DEBUG -Method "TOKEN"
+
+                # Try device code flow with direct parameters
+                $msalToken = Get-MsalToken -ClientId $clientId -TenantId $tenantIdToUse -Scopes @($script:PurviewScope) -DeviceCode -ErrorAction Stop
+
+                if ($msalToken -and $msalToken.AccessToken)
+                {
+                    $token = @{
+                        AccessToken = $msalToken.AccessToken
+                        ExpiresOn = $msalToken.ExpiresOn
+                    }
+                    Write-Log "MSAL.PS token acquisition successful!" -Level SUCCESS -Method "TOKEN"
+                    $tokenResult.Method = "MSAL.PS DeviceCode"
+                }
             }
             catch
             {
-                Write-Log "Interactive flow also failed: $($_.Exception.Message)" -Level WARNING -Method "TOKEN"
-                Write-Log "Trying silent token acquisition from cache..." -Method "TOKEN"
+                Write-Log "MSAL.PS method failed: $($_.Exception.Message)" -Level WARNING -Method "TOKEN"
 
-                # Try silent acquisition in case there's a cached token
+                # Method 4: Try Az.Accounts module if available
+                Write-Log "Method 4: Trying Az.Accounts module..." -Method "TOKEN"
                 try
                 {
-                    $token = Get-MsalToken -ClientId $clientId -TenantId $tenantIdToUse -Scopes @($script:PurviewScope) -Silent -ErrorAction Stop
+                    $azModule = Get-Module -Name Az.Accounts -ListAvailable
+                    if ($azModule)
+                    {
+                        Import-Module Az.Accounts -ErrorAction Stop
+                        Write-Log "  Az.Accounts module loaded" -Level DEBUG -Method "TOKEN"
+
+                        # Check if already connected
+                        $azContext = Get-AzContext -ErrorAction SilentlyContinue
+                        if (-not $azContext)
+                        {
+                            Write-Log "  Connecting to Azure..." -Method "TOKEN"
+                            Connect-AzAccount -TenantId $tenantIdToUse -ErrorAction Stop | Out-Null
+                        }
+
+                        # Get token for the Purview resource
+                        $azToken = Get-AzAccessToken -ResourceUrl "https://$script:PurviewResourceId" -ErrorAction Stop
+                        if ($azToken -and $azToken.Token)
+                        {
+                            $token = @{
+                                AccessToken = $azToken.Token
+                                ExpiresOn = $azToken.ExpiresOn
+                            }
+                            Write-Log "Az.Accounts token acquisition successful!" -Level SUCCESS -Method "TOKEN"
+                            $tokenResult.Method = "Az.Accounts"
+                        }
+                    }
+                    else
+                    {
+                        Write-Log "  Az.Accounts module not available" -Level WARNING -Method "TOKEN"
+                        throw "Az.Accounts module not installed"
+                    }
                 }
                 catch
                 {
-                    Write-Log "Silent acquisition failed: $($_.Exception.Message)" -Level ERROR -Method "TOKEN"
-                    throw "All MSAL token acquisition methods failed"
+                    Write-Log "Az.Accounts method failed: $($_.Exception.Message)" -Level ERROR -Method "TOKEN"
+                    throw "All token acquisition methods failed. Last error: $($_.Exception.Message)"
                 }
             }
         }
+    }
 
-        if ($token -and $token.AccessToken)
+    if ($token -and $token.AccessToken)
         {
             Write-Log "Token acquired successfully" -Level SUCCESS -Method "TOKEN"
             Write-Log "  Token length: $($token.AccessToken.Length) characters" -Method "TOKEN"
@@ -983,7 +1100,11 @@ function Test-Method1-InvokeWebRequest
                     $responseBody = $reader.ReadToEnd()
                     Write-Log "  Response Body: $($responseBody.Substring(0, [Math]::Min(500, $responseBody.Length)))" -Level DEBUG -Method "METHOD-1"
                 }
-                catch { }
+                catch
+                {
+                    # Response body not readable - this is expected for some error types
+                    Write-Log "  Could not read response body" -Level DEBUG -Method "METHOD-1"
+                }
             }
 
             $downloadResult.Error = $_.Exception.Message
