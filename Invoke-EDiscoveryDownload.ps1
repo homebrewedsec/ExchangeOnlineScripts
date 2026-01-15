@@ -37,6 +37,13 @@
 .PARAMETER Force
     Overwrite existing files without prompting.
 
+.PARAMETER Quiet
+    Suppress verbose output. Only shows progress, errors, and final summary.
+
+.PARAMETER ThrottleLimit
+    Number of concurrent downloads (requires PowerShell 7+). Default is 1 (sequential).
+    Recommended: 4-8 for faster downloads if network bandwidth allows.
+
 .EXAMPLE
     .\Invoke-EDiscoveryDownload.ps1 -CaseName "ArchiveExport" -ClientId "c8fab561-2078-48cb-8f93-3789d1d72e8a"
     Downloads all PST files from the case matching "ArchiveExport".
@@ -79,7 +86,11 @@ param(
 
     [string]$DownloadToken,
 
-    [switch]$Force
+    [switch]$Force,
+
+    [switch]$Quiet,
+
+    [int]$ThrottleLimit = 1
 )
 
 #region CONFIGURATION
@@ -97,22 +108,30 @@ function Write-Log
 {
     param(
         [string]$Message,
-        [ValidateSet("INFO", "WARNING", "ERROR", "SUCCESS")]
+        [ValidateSet("INFO", "WARNING", "ERROR", "SUCCESS", "PROGRESS")]
         [string]$Level = "INFO"
     )
 
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = "[$timestamp] [$Level] $Message"
 
-    switch ($Level)
+    # Always write to log file
+    Add-Content -Path $script:LogFile -Value $logEntry -ErrorAction SilentlyContinue
+
+    # In quiet mode, only show errors and progress
+    if ($Quiet -and $Level -notin @("ERROR", "PROGRESS"))
     {
-        "ERROR"   { Write-Host $logEntry -ForegroundColor Red }
-        "WARNING" { Write-Host $logEntry -ForegroundColor Yellow }
-        "SUCCESS" { Write-Host $logEntry -ForegroundColor Green }
-        default   { Write-Host $logEntry }
+        return
     }
 
-    Add-Content -Path $script:LogFile -Value $logEntry -ErrorAction SilentlyContinue
+    switch ($Level)
+    {
+        "ERROR"    { Write-Host $logEntry -ForegroundColor Red }
+        "WARNING"  { Write-Host $logEntry -ForegroundColor Yellow }
+        "SUCCESS"  { Write-Host $logEntry -ForegroundColor Green }
+        "PROGRESS" { Write-Host $Message }
+        default    { Write-Host $logEntry }
+    }
 }
 #endregion
 
@@ -414,86 +433,152 @@ try
         'X-AllowWithAADToken' = "true"
     }
 
-    $downloadCounter = 0
-    $successCount = 0
-    $failCount = 0
+    # Check if parallel download is possible (PS7+ and ThrottleLimit > 1)
+    $useParallel = ($ThrottleLimit -gt 1) -and ($PSVersionTable.PSVersion.Major -ge 7)
 
-    foreach ($file in $downloadFiles)
+    if ($useParallel)
     {
-        $downloadCounter++
-        Write-Log "[$downloadCounter/$($downloadFiles.Count)] Downloading: $($file.FileName)"
+        Write-Log "Parallel download enabled: $ThrottleLimit concurrent downloads" -Level PROGRESS
 
-        # Determine output file path
-        $outputFile = Join-Path $OutputPath $file.FileName
+        # Parallel download using ForEach-Object -Parallel (PS7+)
+        $downloadFiles | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+            $file = $_
+            $outputFile = Join-Path $using:OutputPath $file.FileName
+            $headers = $using:headers
+            $forceOverwrite = $using:Force
 
-        # Check if file exists
-        if ((Test-Path $outputFile) -and -not $Force)
-        {
-            Write-Log "  File already exists, skipping (use -Force to overwrite)" -Level WARNING
-            $file.Status = "Skipped"
-            $file.OutputPath = $outputFile
-            continue
-        }
-
-        try
-        {
-            $startTime = Get-Date
-
-            # Suppress progress bar for clean output
-            $prevProgressPref = $ProgressPreference
-            $ProgressPreference = 'SilentlyContinue'
-
-            Invoke-WebRequest -Uri $file.DownloadUrl -Headers $headers -OutFile $outputFile -UseBasicParsing -ErrorAction Stop
-
-            $ProgressPreference = $prevProgressPref
-
-            $duration = ((Get-Date) - $startTime).TotalSeconds
-
-            # Verify file
-            if (Test-Path $outputFile)
+            # Check if file exists
+            if ((Test-Path $outputFile) -and -not $forceOverwrite)
             {
-                $fileInfo = Get-Item $outputFile
+                Write-Host "SKIP: $($file.FileName) (exists)"
+                $file.Status = "Skipped"
+                $file.OutputPath = $outputFile
+                return
+            }
 
-                # Check if it's HTML (error response)
-                $firstBytes = [System.IO.File]::ReadAllBytes($outputFile) | Select-Object -First 100
-                $firstChars = [System.Text.Encoding]::UTF8.GetString($firstBytes)
+            try
+            {
+                $startTime = Get-Date
+                Write-Host "START: $($file.FileName)"
 
-                if ($firstChars -match '<html|<!DOCTYPE')
+                $ProgressPreference = 'SilentlyContinue'
+                Invoke-WebRequest -Uri $file.DownloadUrl -Headers $headers -OutFile $outputFile -UseBasicParsing -ErrorAction Stop
+
+                $duration = ((Get-Date) - $startTime).TotalSeconds
+
+                if (Test-Path $outputFile)
                 {
-                    Write-Log "  ERROR: Downloaded file is HTML (error response)" -Level ERROR
-                    $file.Status = "Failed"
-                    $file.Error = "Downloaded file is HTML error page"
-                    $failCount++
-                }
-                elseif ($fileInfo.Length -lt 1000)
-                {
-                    Write-Log "  WARNING: File is suspiciously small ($($fileInfo.Length) bytes)" -Level WARNING
-                    $file.Status = "Warning"
-                    $file.OutputPath = $outputFile
-                    $successCount++
+                    $fileInfo = Get-Item $outputFile
+                    $firstBytes = [System.IO.File]::ReadAllBytes($outputFile) | Select-Object -First 100
+                    $firstChars = [System.Text.Encoding]::UTF8.GetString($firstBytes)
+
+                    if ($firstChars -match '<html|<!DOCTYPE')
+                    {
+                        Write-Host "FAIL: $($file.FileName) - HTML error response" -ForegroundColor Red
+                        $file.Status = "Failed"
+                        $file.Error = "Downloaded file is HTML error page"
+                    }
+                    elseif ($fileInfo.Length -lt 1000)
+                    {
+                        Write-Host "WARN: $($file.FileName) - $($fileInfo.Length) bytes" -ForegroundColor Yellow
+                        $file.Status = "Warning"
+                        $file.OutputPath = $outputFile
+                    }
+                    else
+                    {
+                        $sizeMB = [math]::Round($fileInfo.Length / 1MB, 2)
+                        $speed = [math]::Round($sizeMB / $duration, 1)
+                        Write-Host "OK: $($file.FileName) - $sizeMB MB in $([math]::Round($duration, 1))s ($speed MB/s)" -ForegroundColor Green
+                        $file.Status = "Success"
+                        $file.OutputPath = $outputFile
+                    }
                 }
                 else
                 {
-                    Write-Log "  Downloaded: $([math]::Round($fileInfo.Length / 1MB, 2)) MB in $([math]::Round($duration, 1))s" -Level SUCCESS
-                    $file.Status = "Success"
-                    $file.OutputPath = $outputFile
-                    $successCount++
+                    Write-Host "FAIL: $($file.FileName) - File not created" -ForegroundColor Red
+                    $file.Status = "Failed"
+                    $file.Error = "Output file not created"
                 }
             }
-            else
+            catch
             {
-                Write-Log "  ERROR: Output file not created" -Level ERROR
+                Write-Host "FAIL: $($file.FileName) - $($_.Exception.Message)" -ForegroundColor Red
                 $file.Status = "Failed"
-                $file.Error = "Output file not created"
-                $failCount++
+                $file.Error = $_.Exception.Message
             }
         }
-        catch
+    }
+    else
+    {
+        # Sequential download
+        $downloadCounter = 0
+
+        foreach ($file in $downloadFiles)
         {
-            Write-Log "  ERROR: $($_.Exception.Message)" -Level ERROR
-            $file.Status = "Failed"
-            $file.Error = $_.Exception.Message
-            $failCount++
+            $downloadCounter++
+            Write-Log "[$downloadCounter/$($downloadFiles.Count)] Downloading: $($file.FileName)" -Level PROGRESS
+
+            $outputFile = Join-Path $OutputPath $file.FileName
+
+            if ((Test-Path $outputFile) -and -not $Force)
+            {
+                Write-Log "  File already exists, skipping (use -Force to overwrite)" -Level WARNING
+                $file.Status = "Skipped"
+                $file.OutputPath = $outputFile
+                continue
+            }
+
+            try
+            {
+                $startTime = Get-Date
+                $prevProgressPref = $ProgressPreference
+                $ProgressPreference = 'SilentlyContinue'
+
+                Invoke-WebRequest -Uri $file.DownloadUrl -Headers $headers -OutFile $outputFile -UseBasicParsing -ErrorAction Stop
+
+                $ProgressPreference = $prevProgressPref
+                $duration = ((Get-Date) - $startTime).TotalSeconds
+
+                if (Test-Path $outputFile)
+                {
+                    $fileInfo = Get-Item $outputFile
+                    $firstBytes = [System.IO.File]::ReadAllBytes($outputFile) | Select-Object -First 100
+                    $firstChars = [System.Text.Encoding]::UTF8.GetString($firstBytes)
+
+                    if ($firstChars -match '<html|<!DOCTYPE')
+                    {
+                        Write-Log "  ERROR: Downloaded file is HTML (error response)" -Level ERROR
+                        $file.Status = "Failed"
+                        $file.Error = "Downloaded file is HTML error page"
+                    }
+                    elseif ($fileInfo.Length -lt 1000)
+                    {
+                        Write-Log "  WARNING: File is suspiciously small ($($fileInfo.Length) bytes)" -Level WARNING
+                        $file.Status = "Warning"
+                        $file.OutputPath = $outputFile
+                    }
+                    else
+                    {
+                        $sizeMB = [math]::Round($fileInfo.Length / 1MB, 2)
+                        $speed = [math]::Round($sizeMB / $duration, 1)
+                        Write-Log "  OK: $sizeMB MB in $([math]::Round($duration, 1))s ($speed MB/s)" -Level PROGRESS
+                        $file.Status = "Success"
+                        $file.OutputPath = $outputFile
+                    }
+                }
+                else
+                {
+                    Write-Log "  ERROR: Output file not created" -Level ERROR
+                    $file.Status = "Failed"
+                    $file.Error = "Output file not created"
+                }
+            }
+            catch
+            {
+                Write-Log "  ERROR: $($_.Exception.Message)" -Level ERROR
+                $file.Status = "Failed"
+                $file.Error = $_.Exception.Message
+            }
         }
     }
 
@@ -501,38 +586,20 @@ try
     #endregion
 
     #region SUMMARY
-    Write-Log "============================================================"
-    Write-Log "DOWNLOAD SUMMARY"
-    Write-Log "============================================================"
-    Write-Log ""
-    Write-Log "Case: $resolvedCaseName"
-    Write-Log "Total files: $($downloadFiles.Count)"
-    Write-Log "Successful: $successCount" -Level $(if ($successCount -gt 0) { "SUCCESS" } else { "INFO" })
-    Write-Log "Failed: $failCount" -Level $(if ($failCount -gt 0) { "ERROR" } else { "INFO" })
-    Write-Log ""
+    # Calculate counts from status
+    $successCount = @($downloadFiles | Where-Object { $_.Status -eq "Success" -or $_.Status -eq "Warning" }).Count
+    $failCount = @($downloadFiles | Where-Object { $_.Status -eq "Failed" }).Count
+    $skipCount = @($downloadFiles | Where-Object { $_.Status -eq "Skipped" }).Count
 
     # Export summary CSV
     $downloadFiles | Select-Object ExportId, FileName, @{N='SizeMB';E={[math]::Round($_.Size / 1MB, 2)}}, Status, OutputPath, Error |
         Export-Csv -Path $script:SummaryFile -NoTypeInformation
 
-    Write-Log "Output files:"
-    Write-Log "  Summary CSV: $script:SummaryFile"
-    Write-Log "  Log file: $script:LogFile"
     Write-Log ""
-
-    # List downloaded files
-    $successFiles = @($downloadFiles | Where-Object { $_.Status -eq "Success" -or $_.Status -eq "Warning" })
-    if ($successFiles.Count -gt 0)
-    {
-        Write-Log "Downloaded files:"
-        foreach ($f in $successFiles)
-        {
-            Write-Log "  $($f.OutputPath)"
-        }
-    }
-
+    $summaryMsg = "Done. $successCount downloaded, $failCount failed"
+    if ($skipCount -gt 0) { $summaryMsg += ", $skipCount skipped" }
+    Write-Log "$summaryMsg. Summary: $script:SummaryFile" -Level PROGRESS
     Write-Log ""
-    Write-Log "============================================================"
     #endregion
 }
 catch
