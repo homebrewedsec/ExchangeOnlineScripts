@@ -761,9 +761,29 @@ function Get-PurviewDownloadToken
     try
     {
         # Determine client ID to use - for delegated auth, use Azure PowerShell default
-        # The app registration's client ID won't work unless it has delegated permissions configured
         $clientId = "1950a258-227b-4e31-a9cf-717495945fc2"  # Azure PowerShell default - has delegated permissions
         Write-Log "  Using ClientId: $clientId (Azure PowerShell - supports delegated auth)" -Method "TOKEN"
+
+        # Get tenant ID from Graph context if not provided
+        $tenantIdToUse = $script:TenantId
+        if (-not $tenantIdToUse)
+        {
+            $graphContext = Get-MgContext -ErrorAction SilentlyContinue
+            if ($graphContext -and $graphContext.TenantId)
+            {
+                $tenantIdToUse = $graphContext.TenantId
+                Write-Log "  Using TenantId from Graph context: $tenantIdToUse" -Method "TOKEN"
+            }
+            else
+            {
+                Write-Log "  No TenantId available - will use common endpoint" -Level WARNING -Method "TOKEN"
+                $tenantIdToUse = "common"
+            }
+        }
+
+        # Create a public client application for MSAL
+        Write-Log "Creating MSAL public client application..." -Method "TOKEN"
+        $publicClient = New-MsalClientApplication -ClientId $clientId -TenantId $tenantIdToUse -ErrorAction Stop
 
         # Try device code flow first (works better for scripts/servers)
         Write-Log "Attempting device code flow authentication..." -Method "TOKEN"
@@ -772,7 +792,7 @@ function Get-PurviewDownloadToken
         $token = $null
         try
         {
-            $token = Get-MsalToken -ClientId $clientId -TenantId $script:TenantId -Scopes @($script:PurviewScope) -DeviceCode -ErrorAction Stop
+            $token = $publicClient | Get-MsalToken -Scopes @($script:PurviewScope) -DeviceCode -ErrorAction Stop
         }
         catch
         {
@@ -780,7 +800,7 @@ function Get-PurviewDownloadToken
             Write-Log "Falling back to interactive browser authentication..." -Method "TOKEN"
 
             # Fallback to interactive
-            $token = Get-MsalToken -ClientId $clientId -TenantId $script:TenantId -Scopes @($script:PurviewScope) -Interactive -ErrorAction Stop
+            $token = $publicClient | Get-MsalToken -Scopes @($script:PurviewScope) -Interactive -ErrorAction Stop
         }
 
         if ($token -and $token.AccessToken)
