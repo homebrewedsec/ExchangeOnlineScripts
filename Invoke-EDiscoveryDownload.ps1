@@ -469,7 +469,10 @@ try
                 if (Test-Path $outputFile)
                 {
                     $fileInfo = Get-Item $outputFile
-                    $firstBytes = [System.IO.File]::ReadAllBytes($outputFile) | Select-Object -First 100
+                    $stream = [System.IO.File]::OpenRead($outputFile)
+                    $firstBytes = New-Object byte[] 100
+                    $stream.Read($firstBytes, 0, 100) | Out-Null
+                    $stream.Close()
                     $firstChars = [System.Text.Encoding]::UTF8.GetString($firstBytes)
 
                     if ($firstChars -match '<html|<!DOCTYPE')
@@ -542,7 +545,10 @@ try
                 if (Test-Path $outputFile)
                 {
                     $fileInfo = Get-Item $outputFile
-                    $firstBytes = [System.IO.File]::ReadAllBytes($outputFile) | Select-Object -First 100
+                    $stream = [System.IO.File]::OpenRead($outputFile)
+                    $firstBytes = New-Object byte[] 100
+                    $stream.Read($firstBytes, 0, 100) | Out-Null
+                    $stream.Close()
                     $firstChars = [System.Text.Encoding]::UTF8.GetString($firstBytes)
 
                     if ($firstChars -match '<html|<!DOCTYPE')
