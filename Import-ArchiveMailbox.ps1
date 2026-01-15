@@ -421,25 +421,51 @@ foreach ($zip in $zipFiles)
         }
         else
         {
-            # Get base name for the PSTs (strip _Part1, _Part2 suffixes if present)
+            # Check if this is a multi-part ZIP (has _Part1, _Part2, etc. suffix)
+            $partMatch = [regex]::Match($zip.BaseName, '_Part(\d+)$')
+            $partSuffix = ""
+            if ($partMatch.Success)
+            {
+                $partSuffix = "_Part$($partMatch.Groups[1].Value)"
+            }
+
+            # Get base name for the PSTs (strip _Part suffix if present)
             $basePstName = $zip.BaseName -replace '_Part\d+$', ''
 
             $pstIndex = 0
             foreach ($extractedPst in $allPsts)
             {
-                # Generate unique PST name
-                if ($allPsts.Count -eq 1)
+                # Generate unique PST name - include part suffix to prevent collisions
+                if ($allPsts.Count -eq 1 -and -not $partSuffix)
                 {
                     $targetPstName = "$basePstName.pst"
                 }
+                elseif ($allPsts.Count -eq 1)
+                {
+                    # Single PST but multi-part ZIP - include part in name
+                    $targetPstName = "$basePstName$partSuffix.pst"
+                }
                 else
                 {
-                    # Multiple PSTs - append .001, .002, etc.
+                    # Multiple PSTs - append part and index
                     $pstIndex++
-                    $targetPstName = "$basePstName.$($pstIndex.ToString('000')).pst"
+                    $targetPstName = "$basePstName$partSuffix.$($pstIndex.ToString('000')).pst"
                 }
 
                 $targetPstPath = Join-Path $OutputPath $targetPstName
+
+                # Check if file already exists, append unique suffix if needed
+                if (Test-Path $targetPstPath)
+                {
+                    $counter = 1
+                    $baseNameNoExt = [System.IO.Path]::GetFileNameWithoutExtension($targetPstName)
+                    while (Test-Path $targetPstPath)
+                    {
+                        $targetPstName = "$baseNameNoExt`_$counter.pst"
+                        $targetPstPath = Join-Path $OutputPath $targetPstName
+                        $counter++
+                    }
+                }
 
                 # Move and rename the PST
                 Move-Item -Path $extractedPst.FullName -Destination $targetPstPath -Force
