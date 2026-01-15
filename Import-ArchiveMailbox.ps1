@@ -43,6 +43,13 @@
 .PARAMETER RunUpload
     Switch. If specified along with AzureSasUrl, executes AzCopy to upload PSTs.
 
+.PARAMETER DeleteZipAfterExtract
+    Switch. Delete ZIP files after successful extraction and verification.
+    Verification compares extracted PST count/size against ZIP contents.
+
+.PARAMETER AzCopyPath
+    Path to azcopy.exe. If not specified, searches PATH and common install locations.
+
 .EXAMPLE
     .\Import-ArchiveMailbox.ps1 -ZipFolderPath "C:\ZIPs" -MappingCsvPath "mapping.csv"
 
@@ -95,7 +102,13 @@ param(
     [string]$AzureSasUrl,
 
     [Parameter(Mandatory = $false)]
-    [switch]$RunUpload
+    [switch]$RunUpload,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DeleteZipAfterExtract,
+
+    [Parameter(Mandatory = $false)]
+    [string]$AzCopyPath
 )
 
 #region VALIDATION
@@ -200,11 +213,46 @@ foreach ($row in $mappingCsv)
 }
 
 # Check for AzCopy
-$azcopyPath = Get-Command azcopy -ErrorAction SilentlyContinue
-if (-not $azcopyPath)
+$azcopyExe = $null
+if ($AzCopyPath)
 {
-    Write-Warning "AzCopy not found in PATH. You will need it for the upload step."
+    if (Test-Path $AzCopyPath)
+    {
+        $azcopyExe = $AzCopyPath
+        Write-Output "Using specified AzCopy: $azcopyExe"
+    }
+    else
+    {
+        Write-Error "Specified AzCopy path not found: $AzCopyPath"
+        exit 1
+    }
+}
+else
+{
+    # Search common locations
+    $azcopyLocations = @(
+        (Get-Command azcopy -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
+        (Get-Command azcopy.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
+        "$env:LOCALAPPDATA\Microsoft\Azure\AzCopy\azcopy.exe",
+        "$env:ProgramFiles\Azure\AzCopy\azcopy.exe",
+        "C:\AzCopy\azcopy.exe"
+    )
+    foreach ($loc in $azcopyLocations)
+    {
+        if ($loc -and (Test-Path $loc))
+        {
+            $azcopyExe = $loc
+            Write-Output "Found AzCopy: $azcopyExe"
+            break
+        }
+    }
+}
+
+if (-not $azcopyExe)
+{
+    Write-Warning "AzCopy not found. You will need it for the upload step."
     Write-Warning "Download from: https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azcopy-v10"
+    Write-Warning "Or specify path with -AzCopyPath parameter"
     Write-Output ""
 }
 
@@ -401,11 +449,47 @@ foreach ($zip in $zipFiles)
                 Write-Output "  - Extracted: $($extractedPst.Name) -> $targetPstName ($sizeGB GB)"
 
                 $extractedPsts += [PSCustomObject]@{
-                    SourceEmail = $sourceEmail
-                    TargetEmail = $targetEmail
-                    PstName     = $targetPstName
-                    PstPath     = $targetPstPath
-                    SizeGB      = $sizeGB
+                    SourceEmail  = $sourceEmail
+                    TargetEmail  = $targetEmail
+                    PstName      = $targetPstName
+                    PstPath      = $targetPstPath
+                    SizeGB       = $sizeGB
+                    SourceZip    = $zip.Name
+                }
+            }
+
+            # Delete ZIP after successful extraction if requested
+            if ($DeleteZipAfterExtract)
+            {
+                # Verify all PSTs exist and have size > 0
+                $extractedForThisZip = $extractedPsts | Where-Object { $_.SourceZip -eq $zip.Name }
+                $allVerified = $true
+
+                foreach ($pst in $extractedForThisZip)
+                {
+                    if (-not (Test-Path $pst.PstPath) -or (Get-Item $pst.PstPath).Length -eq 0)
+                    {
+                        $allVerified = $false
+                        Write-Warning "  - Verification failed for: $($pst.PstName)"
+                        break
+                    }
+                }
+
+                if ($allVerified -and $extractedForThisZip.Count -gt 0)
+                {
+                    try
+                    {
+                        Remove-Item -Path $zip.FullName -Force
+                        Write-Output "  - Deleted ZIP: $($zip.Name)"
+                    }
+                    catch
+                    {
+                        Write-Warning "  - Failed to delete ZIP: $_"
+                    }
+                }
+                else
+                {
+                    Write-Warning "  - Skipping ZIP deletion - verification failed"
                 }
             }
         }
@@ -490,20 +574,21 @@ if ($RunUpload -and $AzureSasUrl)
     Write-Output ""
 
     # Verify AzCopy is available
-    if (-not $azcopyPath)
+    if (-not $azcopyExe)
     {
-        Write-Error "AzCopy is required for upload but was not found in PATH"
+        Write-Error "AzCopy is required for upload but was not found"
         Write-Error "Download from: https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azcopy-v10"
+        Write-Error "Or specify path with -AzCopyPath parameter"
         exit 1
     }
 
-    Write-Output "Running: azcopy.exe copy `"$OutputPath`" `"<SAS_URL>`" --recursive=true"
+    Write-Output "Running: `"$azcopyExe`" copy `"$OutputPath`" `"<SAS_URL>`" --recursive=true"
     Write-Output ""
 
     try
     {
         # Execute AzCopy
-        $azcopyResult = & azcopy.exe copy "$OutputPath" "$AzureSasUrl" --recursive=true 2>&1
+        $azcopyResult = & $azcopyExe copy "$OutputPath" "$AzureSasUrl" --recursive=true 2>&1
 
         # Output the result
         $azcopyResult | ForEach-Object { Write-Output $_ }
@@ -594,18 +679,20 @@ else
 
     if ($AzureSasUrl)
     {
+        $azcopyCmd = if ($azcopyExe) { $azcopyExe } else { "azcopy.exe" }
         Write-Output "2. Run AzCopy to upload PSTs:"
         Write-Output ""
-        Write-Output "   azcopy.exe copy `"$OutputPath`" `"$AzureSasUrl`" --recursive=true"
+        Write-Output "   `"$azcopyCmd`" copy `"$OutputPath`" `"$AzureSasUrl`" --recursive=true"
         Write-Output ""
         Write-Output "   Or re-run this script with -RunUpload to execute automatically"
         Write-Output ""
     }
     else
     {
+        $azcopyCmd = if ($azcopyExe) { $azcopyExe } else { "azcopy.exe" }
         Write-Output "2. Run AzCopy to upload PSTs:"
         Write-Output ""
-        Write-Output "   azcopy.exe copy `"$OutputPath`" `"<SAS_URL_FROM_PURVIEW>`" --recursive=true"
+        Write-Output "   `"$azcopyCmd`" copy `"$OutputPath`" `"<SAS_URL_FROM_PURVIEW>`" --recursive=true"
         Write-Output ""
         Write-Output "   Or re-run with: -AzureSasUrl `"<SAS_URL>`" -RunUpload"
         Write-Output ""
