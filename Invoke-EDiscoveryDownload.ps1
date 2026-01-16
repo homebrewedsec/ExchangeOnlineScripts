@@ -44,6 +44,11 @@
     Number of concurrent downloads (requires PowerShell 7+). Default is 1 (sequential).
     Recommended: 4-8 for faster downloads if network bandwidth allows.
 
+.PARAMETER ResumeFrom
+    Path to a previous summary CSV file. When specified, only files that did not complete
+    successfully (Status not "Success" or "Skipped") will be downloaded. Use this to resume
+    interrupted downloads without re-downloading completed files.
+
 .EXAMPLE
     .\Invoke-EDiscoveryDownload.ps1 -CaseName "ArchiveExport" -ClientId "c8fab561-2078-48cb-8f93-3789d1d72e8a"
     Downloads all PST files from the case matching "ArchiveExport".
@@ -55,6 +60,10 @@
 .EXAMPLE
     .\Invoke-EDiscoveryDownload.ps1 -CaseName "MyCase" -ClientId "..." -DownloadToken "eyJ0..."
     Uses a pre-captured token for fully automated downloads (no interactive prompt).
+
+.EXAMPLE
+    .\Invoke-EDiscoveryDownload.ps1 -CaseName "MyCase" -ClientId "..." -ResumeFrom ".\EDiscoveryDownload_Summary_20250115_120000.csv"
+    Resumes a previous download, only downloading files that failed or were not completed.
 
 .NOTES
     Author: Hudson Bush / Claude AI
@@ -90,7 +99,9 @@ param(
 
     [switch]$Quiet,
 
-    [int]$ThrottleLimit = 1
+    [int]$ThrottleLimit = 1,
+
+    [string]$ResumeFrom
 )
 
 #region CONFIGURATION
@@ -304,6 +315,37 @@ try
     Write-Log ""
     #endregion
 
+    #region RESUME FILTERING
+    if ($ResumeFrom)
+    {
+        if (-not (Test-Path $ResumeFrom))
+        {
+            throw "Resume file not found: $ResumeFrom"
+        }
+
+        Write-Log "Filtering files based on previous run: $ResumeFrom"
+
+        $previousRun = Import-Csv -Path $ResumeFrom
+        $completedFiles = $previousRun | Where-Object { $_.Status -in @("Success", "Skipped") } | Select-Object -ExpandProperty FileName
+
+        $originalCount = $downloadFiles.Count
+        $downloadFiles = $downloadFiles | Where-Object { $_.FileName -notin $completedFiles }
+
+        $skippedCount = $originalCount - $downloadFiles.Count
+        Write-Log "  Previously completed: $skippedCount files (skipping)"
+        Write-Log "  Remaining to download: $($downloadFiles.Count) files" -Level PROGRESS
+
+        if ($downloadFiles.Count -eq 0)
+        {
+            Write-Log ""
+            Write-Log "All files already completed. Nothing to download." -Level SUCCESS
+            return
+        }
+
+        Write-Log ""
+    }
+    #endregion
+
     #region ACQUIRE DOWNLOAD TOKEN
     Write-Log "Acquiring download token for MicrosoftPurviewEDiscovery..."
     Write-Log "NOTE: Microsoft requires interactive (delegated) authentication for downloads"
@@ -382,9 +424,19 @@ try
 
         Write-Log "  MSAL.NET assembly loaded"
 
-        # Build public client with explicit redirect URI
+        # Build public client with redirect URI based on PS version
         $authority = "https://login.microsoftonline.com/$script:TenantId"
-        $redirectUri = "https://login.microsoftonline.com/common/oauth2/nativeclient"
+
+        # PS7+ (.NET Core) needs localhost, Windows PowerShell uses nativeclient
+        if ($PSVersionTable.PSVersion.Major -ge 6)
+        {
+            $redirectUri = "http://localhost"
+        }
+        else
+        {
+            $redirectUri = "https://login.microsoftonline.com/common/oauth2/nativeclient"
+        }
+        Write-Log "  Using redirect URI: $redirectUri"
 
         $publicClientBuilder = [Microsoft.Identity.Client.PublicClientApplicationBuilder]::Create($ClientId)
         $publicClientBuilder = $publicClientBuilder.WithAuthority($authority)
@@ -453,7 +505,7 @@ try
             # Check if file exists
             if ((Test-Path $outputFile) -and -not $forceOverwrite)
             {
-                Write-Host "SKIP: $($file.FileName) (exists)"
+                Write-Host "SKIP: $($file.FileName) - already exists"
                 $file.Status = "Skipped"
                 $file.OutputPath = $outputFile
                 return
@@ -528,7 +580,7 @@ try
 
             if ((Test-Path $outputFile) -and -not $Force)
             {
-                Write-Log "  File already exists, skipping (use -Force to overwrite)" -Level WARNING
+                Write-Log "  File already exists, skipping" -Level WARNING
                 $file.Status = "Skipped"
                 $file.OutputPath = $outputFile
                 continue
