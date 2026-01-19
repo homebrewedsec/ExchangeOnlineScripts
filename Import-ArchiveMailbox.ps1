@@ -50,6 +50,10 @@
 .PARAMETER AzCopyPath
     Path to azcopy.exe. If not specified, searches PATH and common install locations.
 
+.PARAMETER AppendToMapping
+    Path to an existing Purview mapping CSV to append to instead of creating a new one.
+    Useful for multi-batch processing or re-extracting failed ZIPs.
+
 .EXAMPLE
     .\Import-ArchiveMailbox.ps1 -ZipFolderPath "C:\ZIPs" -MappingCsvPath "mapping.csv"
 
@@ -108,7 +112,10 @@ param(
     [switch]$DeleteZipAfterExtract,
 
     [Parameter(Mandatory = $false)]
-    [string]$AzCopyPath
+    [string]$AzCopyPath,
+
+    [Parameter(Mandatory = $false)]
+    [string]$AppendToMapping
 )
 
 #region VALIDATION
@@ -405,7 +412,13 @@ foreach ($zip in $zipFiles)
         if (-not $extractionSuccess)
         {
             Write-Warning "  - All extraction methods failed"
-            $failedExtractions += $zip.Name
+            $failedExtractions += [PSCustomObject]@{
+                ZipFileName  = $zip.Name
+                ZipFilePath  = $zip.FullName
+                SourceEmail  = $sourceEmail
+                ErrorMessage = "All extraction methods failed"
+                AttemptedAt  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            }
             if (Test-Path $tempExtractPath) { Remove-Item $tempExtractPath -Recurse -Force -ErrorAction SilentlyContinue }
             Write-Output ""
             continue
@@ -417,7 +430,13 @@ foreach ($zip in $zipFiles)
         if ($allPsts.Count -eq 0)
         {
             Write-Warning "  - No PST files found in ZIP"
-            $failedExtractions += $zip.Name
+            $failedExtractions += [PSCustomObject]@{
+                ZipFileName  = $zip.Name
+                ZipFilePath  = $zip.FullName
+                SourceEmail  = $sourceEmail
+                ErrorMessage = "No PST files found in ZIP"
+                AttemptedAt  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            }
         }
         else
         {
@@ -529,7 +548,13 @@ foreach ($zip in $zipFiles)
     catch
     {
         Write-Warning "  - Extraction failed: $_"
-        $failedExtractions += $zip.Name
+        $failedExtractions += [PSCustomObject]@{
+            ZipFileName  = $zip.Name
+            ZipFilePath  = $zip.FullName
+            SourceEmail  = if ($sourceEmail) { $sourceEmail } else { "Unknown" }
+            ErrorMessage = $_.Exception.Message
+            AttemptedAt  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        }
 
         # Clean up temp folder on error
         $tempExtractPath = Join-Path $OutputPath "_temp_extract"
@@ -547,6 +572,16 @@ Write-Output "  - Successfully extracted: $($extractedPsts.Count)"
 Write-Output "  - Unmatched ZIPs: $($unmatchedZips.Count)"
 Write-Output "  - Failed extractions: $($failedExtractions.Count)"
 Write-Output ""
+
+# Export failed extractions to CSV if any
+if ($failedExtractions.Count -gt 0)
+{
+    $failedTimestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $failedCsvPath = Join-Path $OutputPath "FailedExtractions_$failedTimestamp.csv"
+    $failedExtractions | Export-Csv -Path $failedCsvPath -NoTypeInformation
+    Write-Warning "Failed extractions exported to: $failedCsvPath"
+    Write-Output ""
+}
 #endregion
 
 #region STEP 2: GENERATE PURVIEW MAPPING CSV
@@ -578,9 +613,28 @@ foreach ($pst in $extractedPsts)
     }
 }
 
-# Generate output filename
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$purviewCsvPath = Join-Path $OutputPath "PurviewMapping_$timestamp.csv"
+# Handle append mode or generate new file
+if ($AppendToMapping)
+{
+    if (Test-Path $AppendToMapping)
+    {
+        Write-Output "Appending to existing mapping: $AppendToMapping"
+        $existingMapping = Import-Csv -Path $AppendToMapping
+        $purviewMapping = @($existingMapping) + @($purviewMapping)
+        $purviewCsvPath = $AppendToMapping
+    }
+    else
+    {
+        Write-Warning "Append target not found, creating new file: $AppendToMapping"
+        $purviewCsvPath = $AppendToMapping
+    }
+}
+else
+{
+    # Generate new output filename
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $purviewCsvPath = Join-Path $OutputPath "PurviewMapping_$timestamp.csv"
+}
 
 # Export mapping CSV
 $purviewMapping | Export-Csv -Path $purviewCsvPath -NoTypeInformation
@@ -674,8 +728,9 @@ if ($failedExtractions.Count -gt 0)
     Write-Warning "Failed extractions:"
     foreach ($failed in $failedExtractions)
     {
-        Write-Warning "  - $failed"
+        Write-Warning "  - $($failed.ZipFileName): $($failed.ErrorMessage)"
     }
+    Write-Warning "See FailedExtractions CSV for details."
     Write-Output ""
 }
 
