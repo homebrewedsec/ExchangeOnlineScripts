@@ -604,7 +604,7 @@ foreach ($pst in $extractedPsts)
         FilePath            = $FilePath
         Name                = $pst.PstName
         Mailbox             = $pst.TargetEmail
-        IsArchive           = "TRUE"
+        IsArchive           = "FALSE"
         TargetRootFolder    = "/"
         ContentCodePage     = ""
         SPFileContainer     = ""
