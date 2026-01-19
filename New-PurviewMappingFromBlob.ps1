@@ -172,8 +172,15 @@ $uri = [System.Uri]$SasUrl
 $baseUrl = "$($uri.Scheme)://$($uri.Host)$($uri.AbsolutePath)"
 $sasToken = $uri.Query
 
+Write-Host "  Container: $baseUrl"
+if ($BlobPrefix)
+{
+    Write-Host "  Prefix filter: $BlobPrefix"
+}
+
 # List blobs using REST API
 $marker = $null
+$totalBlobsScanned = 0
 do
 {
     $listUrl = "$baseUrl$sasToken&restype=container&comp=list"
@@ -191,14 +198,31 @@ do
         $response = Invoke-RestMethod -Uri $listUrl -Method Get
         $blobs = $response.EnumerationResults.Blobs.Blob
 
+        # Debug: Show what we got back
+        if ($null -eq $blobs)
+        {
+            Write-Host "  No blobs returned in this batch" -ForegroundColor Yellow
+            # Check if response has different structure
+            if ($response.EnumerationResults)
+            {
+                Write-Host "  EnumerationResults found, checking structure..." -ForegroundColor Yellow
+                $response.EnumerationResults | Get-Member -MemberType Property | ForEach-Object {
+                    Write-Host "    Property: $($_.Name)" -ForegroundColor Gray
+                }
+            }
+        }
+
         foreach ($blob in $blobs)
         {
-            if ($blob.Name -like "*.pst")
+            $totalBlobsScanned++
+            # Case-insensitive PST check
+            if ($blob.Name -match '\.pst$')
             {
                 $pstBlobs += [PSCustomObject]@{
                     Name = $blob.Name
                     Size = [long]$blob.Properties.'Content-Length'
                 }
+                Write-Host "  Found: $($blob.Name)" -ForegroundColor Gray
             }
         }
 
@@ -206,10 +230,12 @@ do
     }
     catch
     {
+        Write-Host "  Error response: $($_.Exception.Message)" -ForegroundColor Red
         throw "Failed to list blobs: $($_.Exception.Message)"
     }
 } while ($marker)
 
+Write-Host "  Total blobs scanned: $totalBlobsScanned"
 Write-Host "  PST files found: $($pstBlobs.Count)"
 #endregion
 
