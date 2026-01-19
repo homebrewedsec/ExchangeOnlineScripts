@@ -83,10 +83,15 @@ if ($MappingCsvPath)
         throw "Mapping CSV not found: $MappingCsvPath"
     }
     $useMapping = $true
+    Write-Host "Using mapping CSV for source-to-target email lookup" -ForegroundColor Cyan
 }
 else
 {
-    Write-Host "No mapping CSV provided - will extract emails from filenames and use as target"
+    Write-Host ""
+    Write-Host "WARNING: No mapping CSV provided!" -ForegroundColor Yellow
+    Write-Host "  Source emails from filenames will be used as target emails (same tenant)" -ForegroundColor Yellow
+    Write-Host "  For cross-tenant migration, provide -MappingCsvPath with SourceEmail and TargetEmail columns" -ForegroundColor Yellow
+    Write-Host ""
 }
 
 # Validate append target if specified
@@ -353,17 +358,20 @@ foreach ($blob in $pstBlobs)
             {
                 $targetEmail = $emailLookup[$lookupKey]
             }
+            else
+            {
+                Write-Host "  DEBUG: No mapping found for key: $lookupKey" -ForegroundColor Gray
+            }
         }
         else
         {
             # No mapping CSV - convert encoded email back to proper format and use as target
-            # Pattern: user_at_domain_com -> user@domain.com
+            # Pattern: first_last_at_domain_com -> first.last@domain.com
             $targetEmail = $extractedEmail -replace '_at_', '@'
-            # Replace remaining underscores with dots (for domain parts)
-            # But need to be careful - only replace underscores that are part of the domain
+            # Replace underscores with dots in both local and domain parts
             if ($targetEmail -match '^([^@]+)@(.+)$')
             {
-                $localPart = $Matches[1]
+                $localPart = $Matches[1] -replace '_', '.'
                 $domainPart = $Matches[2] -replace '_', '.'
                 $targetEmail = "$localPart@$domainPart"
             }
