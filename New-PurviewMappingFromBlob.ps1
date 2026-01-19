@@ -221,11 +221,21 @@ $purviewMapping = @()
 $unmatchedBlobs = @()
 $matchedCount = 0
 
-# Determine FilePath value (container name from URL)
+# Determine FilePath value for Purview mapping
 if (-not $FilePath)
 {
-    $FilePath = $uri.AbsolutePath.TrimStart('/')
+    if ($BlobPrefix)
+    {
+        # Use BlobPrefix as FilePath (trim trailing slash)
+        $FilePath = $BlobPrefix.TrimEnd('/')
+    }
+    else
+    {
+        # Default to container name from URL
+        $FilePath = $uri.AbsolutePath.TrimStart('/')
+    }
 }
+Write-Host "FilePath for Purview mapping: $FilePath"
 
 foreach ($blob in $pstBlobs)
 {
