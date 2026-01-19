@@ -1,12 +1,15 @@
 <#
 .SYNOPSIS
-    Validates downloaded eDiscovery files against expected sizes from summary CSVs.
+    Validates downloaded eDiscovery files against expected sizes.
 
 .DESCRIPTION
-    This script compares local files against expected sizes from either the download
-    summary CSV or export summary CSV. It identifies missing, corrupt, or partial files
-    and outputs a quality check report that can be used with Invoke-EDiscoveryDownload.ps1
-    -ReDownloadFrom to re-download failed files.
+    This script compares local files against expected sizes from either:
+    - A download/export summary CSV file
+    - Directly from an eDiscovery case via Microsoft Graph API
+
+    It identifies missing, corrupt, or partial files and outputs a quality check
+    report that can be used with Invoke-EDiscoveryDownload.ps1 -ReDownloadFrom
+    to re-download failed files.
 
     Status values in output:
     - Pass: File exists and size matches expected (within tolerance)
@@ -19,11 +22,18 @@
 
 .PARAMETER SummaryCsvPath
     Path to the summary CSV file (from download or export script).
+    Not required if using -CaseId or -CaseName.
 
 .PARAMETER SummaryType
     Type of summary CSV: "Download" (default) or "Export".
     - Download: Uses FileName and SizeMB columns from Invoke-EDiscoveryDownload output
     - Export: Uses UPN and ArchiveSizeBytes columns from Export-ArchiveMailbox output
+
+.PARAMETER CaseId
+    eDiscovery case ID to query directly via Graph API. Requires Microsoft.Graph module.
+
+.PARAMETER CaseName
+    eDiscovery case name to search for. Requires Microsoft.Graph module.
 
 .PARAMETER TolerancePercent
     Acceptable size variance percentage before flagging as mismatch. Default is 1%.
@@ -39,19 +49,22 @@
     Validates files against download summary with default 1% tolerance.
 
 .EXAMPLE
+    .\Test-EDiscoveryQuality.ps1 -FolderPath "C:\Downloads" -CaseName "ArchiveExport"
+    Validates files directly against the eDiscovery case (requires Graph connection).
+
+.EXAMPLE
     .\Test-EDiscoveryQuality.ps1 -FolderPath "C:\Downloads" -SummaryCsvPath ".\summary.csv" -DeleteBadFiles
     Validates files and deletes any that fail validation.
 
-.EXAMPLE
-    .\Test-EDiscoveryQuality.ps1 -FolderPath "C:\Downloads" -SummaryCsvPath ".\ArchiveExport_Summary.csv" -SummaryType Export
-    Validates against export summary (uses ArchiveSizeBytes for comparison).
-
 .NOTES
     Author: Hudson Bush / Claude AI
-    Version: 1.0
+    Version: 1.1
 
     Output CSV can be used with:
     Invoke-EDiscoveryDownload.ps1 -ReDownloadFrom ".\QualityCheck_*.csv"
+
+    For eDiscovery case mode, connect first with:
+    Connect-MgGraph -Scopes "eDiscovery.Read.All"
 #>
 
 [CmdletBinding()]
@@ -59,11 +72,17 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$FolderPath,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $false)]
     [string]$SummaryCsvPath,
 
     [ValidateSet("Download", "Export")]
     [string]$SummaryType = "Download",
+
+    [Parameter(Mandatory = $false)]
+    [string]$CaseId,
+
+    [Parameter(Mandatory = $false)]
+    [string]$CaseName,
 
     [int]$TolerancePercent = 1,
 
@@ -83,7 +102,14 @@ if (-not (Test-Path $FolderPath))
     throw "Folder not found: $FolderPath"
 }
 
-if (-not (Test-Path $SummaryCsvPath))
+# Must have either CSV or Case specified
+$useCase = $CaseId -or $CaseName
+if (-not $SummaryCsvPath -and -not $useCase)
+{
+    throw "Must specify either -SummaryCsvPath OR -CaseId/-CaseName"
+}
+
+if ($SummaryCsvPath -and -not (Test-Path $SummaryCsvPath))
 {
     throw "Summary CSV not found: $SummaryCsvPath"
 }
@@ -94,40 +120,130 @@ if (-not (Test-Path $OutputPath))
 }
 #endregion
 
-#region LOAD SUMMARY
-Write-Host "Loading summary CSV: $SummaryCsvPath"
-$summaryData = Import-Csv -Path $SummaryCsvPath
+#region LOAD DATA SOURCE
+$summaryData = @()
 
-# Detect and validate columns based on summary type
-if ($SummaryType -eq "Download")
+if ($useCase)
 {
-    # Download summary uses FileName and SizeMB
-    if (-not ($summaryData | Get-Member -Name "FileName" -MemberType NoteProperty))
+    # Query eDiscovery case directly via Graph API
+    Write-Host "Querying eDiscovery case via Microsoft Graph..."
+
+    # Check Graph connection
+    try
     {
-        throw "Download summary CSV must have 'FileName' column"
+        $context = Get-MgContext
+        if (-not $context)
+        {
+            throw "Not connected to Microsoft Graph. Run: Connect-MgGraph -Scopes 'eDiscovery.Read.All'"
+        }
+        Write-Host "  Connected as: $($context.Account)"
     }
-    if (-not ($summaryData | Get-Member -Name "SizeMB" -MemberType NoteProperty))
+    catch
     {
-        throw "Download summary CSV must have 'SizeMB' column"
+        throw "Microsoft Graph connection required. Run: Connect-MgGraph -Scopes 'eDiscovery.Read.All'"
     }
-    Write-Host "  Summary type: Download (using FileName, SizeMB columns)"
-    Write-Host "  Files in summary: $($summaryData.Count)"
+
+    # Resolve case ID
+    $resolvedCaseId = $null
+    if ($CaseId)
+    {
+        $resolvedCaseId = $CaseId
+        Write-Host "  Using case ID: $CaseId"
+    }
+    else
+    {
+        Write-Host "  Searching for case: $CaseName"
+        $cases = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases" -ErrorAction Stop
+        $matchedCase = $cases.value | Where-Object { $_.displayName -like "*$CaseName*" } | Select-Object -First 1
+
+        if (-not $matchedCase)
+        {
+            throw "No case found matching: $CaseName"
+        }
+
+        $resolvedCaseId = $matchedCase.id
+        Write-Host "  Found case: $($matchedCase.displayName) ($resolvedCaseId)"
+    }
+
+    # Get export operations
+    Write-Host "  Retrieving export operations..."
+    $operations = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases/$resolvedCaseId/operations" -ErrorAction Stop
+    $exportOps = $operations.value | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.security.ediscoveryExportOperation' -and $_.status -eq 'succeeded' }
+
+    Write-Host "  Found $($exportOps.Count) completed export(s)"
+
+    # Get file metadata from each export
+    foreach ($op in $exportOps)
+    {
+        $uri = "https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases/$resolvedCaseId/operations/$($op.id)"
+        $response = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
+
+        if ($response.exportFileMetadata)
+        {
+            foreach ($fileMeta in $response.exportFileMetadata)
+            {
+                $summaryData += [PSCustomObject]@{
+                    FileName  = $fileMeta.fileName
+                    SizeMB    = [math]::Round($fileMeta.size / 1MB, 2)
+                    Size      = $fileMeta.size
+                    ExportId  = $op.id
+                    Status    = "FromCase"
+                }
+            }
+        }
+    }
+
+    Write-Host "  Files in case: $($summaryData.Count)"
+    $SummaryType = "Download"  # Use download mode for case data
 }
 else
 {
-    # Export summary uses UPN and ArchiveSizeBytes (or ArchiveSizeGB)
-    if (-not ($summaryData | Get-Member -Name "UPN" -MemberType NoteProperty))
+    # Load from CSV
+    Write-Host "Loading summary CSV: $SummaryCsvPath"
+    $summaryData = Import-Csv -Path $SummaryCsvPath
+
+    # Get column names from CSV header (works even if empty)
+    $csvHeaderLine = Get-Content -Path $SummaryCsvPath -First 1
+    $csvHeaders = $csvHeaderLine -split ',' | ForEach-Object { $_.Trim('"').Trim() }
+
+    Write-Host "  CSV columns found: $($csvHeaders -join ', ')"
+
+    # Detect and validate columns based on summary type (case-insensitive)
+    if ($SummaryType -eq "Download")
     {
-        throw "Export summary CSV must have 'UPN' column"
+        # Download summary uses FileName and SizeMB
+        $hasFileName = $csvHeaders | Where-Object { $_ -ieq "FileName" }
+        $hasSizeMB = $csvHeaders | Where-Object { $_ -ieq "SizeMB" }
+
+        if (-not $hasFileName)
+        {
+            throw "Download summary CSV must have 'FileName' column. Found columns: $($csvHeaders -join ', ')"
+        }
+        if (-not $hasSizeMB)
+        {
+            throw "Download summary CSV must have 'SizeMB' column. Found columns: $($csvHeaders -join ', ')"
+        }
+        Write-Host "  Summary type: Download (using FileName, SizeMB columns)"
+        Write-Host "  Files in summary: $($summaryData.Count)"
     }
-    $hasBytes = $summaryData | Get-Member -Name "ArchiveSizeBytes" -MemberType NoteProperty
-    $hasGB = $summaryData | Get-Member -Name "ArchiveSizeGB" -MemberType NoteProperty
-    if (-not $hasBytes -and -not $hasGB)
+    else
     {
-        throw "Export summary CSV must have 'ArchiveSizeBytes' or 'ArchiveSizeGB' column"
+        # Export summary uses UPN and ArchiveSizeBytes (or ArchiveSizeGB) - case-insensitive
+        $hasUPN = $csvHeaders | Where-Object { $_ -ieq "UPN" }
+        $hasBytes = $csvHeaders | Where-Object { $_ -ieq "ArchiveSizeBytes" }
+        $hasGB = $csvHeaders | Where-Object { $_ -ieq "ArchiveSizeGB" }
+
+        if (-not $hasUPN)
+        {
+            throw "Export summary CSV must have 'UPN' column. Found columns: $($csvHeaders -join ', ')"
+        }
+        if (-not $hasBytes -and -not $hasGB)
+        {
+            throw "Export summary CSV must have 'ArchiveSizeBytes' or 'ArchiveSizeGB' column. Found columns: $($csvHeaders -join ', ')"
+        }
+        Write-Host "  Summary type: Export (using UPN, ArchiveSize columns)"
+        Write-Host "  Records in summary: $($summaryData.Count)"
     }
-    Write-Host "  Summary type: Export (using UPN, ArchiveSize columns)"
-    Write-Host "  Records in summary: $($summaryData.Count)"
 }
 #endregion
 
