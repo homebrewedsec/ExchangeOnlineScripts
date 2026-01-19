@@ -3,22 +3,16 @@
     Generates a Purview import mapping CSV by scanning Azure blob storage for uploaded PSTs.
 
 .DESCRIPTION
-    This script connects to Azure blob storage, lists all PST files, matches them to target
-    mailboxes using a source-to-target mapping CSV, and generates a Purview-compatible
-    mapping CSV for the import job.
+    This script connects to Azure blob storage using a SAS URL, lists all PST files,
+    matches them to target mailboxes using a source-to-target mapping CSV, and generates
+    a Purview-compatible mapping CSV for the import job.
 
     Use this script when you need to regenerate the mapping file after losing the original,
     or when you've uploaded PSTs directly to blob storage without using the Import script.
 
-.PARAMETER ContainerUrl
-    Full Azure blob container URL including SAS token.
+.PARAMETER SasUrl
+    Full Azure blob container URL including SAS token from Purview import job.
     Example: "https://storageaccount.blob.core.windows.net/container?sv=2022-11-02&ss=b..."
-
-.PARAMETER StorageAccountName
-    Storage account name (for Az module authentication instead of SAS token).
-
-.PARAMETER ContainerName
-    Container name (for Az module authentication instead of SAS token).
 
 .PARAMETER MappingCsvPath
     Path to the source-to-target email mapping CSV.
@@ -26,7 +20,7 @@
 
 .PARAMETER FilePath
     The FilePath value for the Purview mapping (folder within container).
-    Defaults to the container name or can be specified manually.
+    Defaults to the container name.
 
 .PARAMETER OutputPath
     Directory for the generated mapping CSV. Defaults to current directory.
@@ -39,36 +33,24 @@
     Example: "Batch1/" to only scan PSTs in the Batch1 folder.
 
 .EXAMPLE
-    .\New-PurviewMappingFromBlob.ps1 -ContainerUrl "https://storage.blob.core.windows.net/psts?sv=..." -MappingCsvPath ".\mapping.csv"
-    Scans container using SAS token and generates mapping.
+    .\New-PurviewMappingFromBlob.ps1 -SasUrl "https://storage.blob.core.windows.net/psts?sv=..." -MappingCsvPath ".\mapping.csv"
+    Scans container and generates Purview mapping.
 
 .EXAMPLE
-    .\New-PurviewMappingFromBlob.ps1 -StorageAccountName "mystorageaccount" -ContainerName "pstcontainer" -MappingCsvPath ".\mapping.csv"
-    Scans container using Az module authentication.
-
-.EXAMPLE
-    .\New-PurviewMappingFromBlob.ps1 -ContainerUrl "https://..." -MappingCsvPath ".\mapping.csv" -BlobPrefix "Batch2/"
+    .\New-PurviewMappingFromBlob.ps1 -SasUrl "https://..." -MappingCsvPath ".\mapping.csv" -BlobPrefix "Batch2/"
     Scans only the Batch2 folder within the container.
 
 .NOTES
     Author: Hudson Bush / Claude AI
-    Version: 1.0
+    Version: 1.1
 
-    Prerequisites:
-    - For SAS token: No modules required (uses REST API)
-    - For Az module: Install-Module Az.Storage -Scope CurrentUser
+    Get the SAS URL from the Purview import job page.
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $false)]
-    [string]$ContainerUrl,
-
-    [Parameter(Mandatory = $false)]
-    [string]$StorageAccountName,
-
-    [Parameter(Mandatory = $false)]
-    [string]$ContainerName,
+    [Parameter(Mandatory = $true)]
+    [string]$SasUrl,
 
     [Parameter(Mandatory = $true)]
     [string]$MappingCsvPath,
@@ -89,28 +71,7 @@ $script:UnmatchedCsvPath = Join-Path $OutputPath "UnmatchedBlobs_$script:Timesta
 #endregion
 
 #region VALIDATION
-# Validate authentication method
-$useSasToken = $false
-
-if ($ContainerUrl)
-{
-    $useSasToken = $true
-    Write-Host "Using SAS token authentication"
-}
-elseif ($StorageAccountName -and $ContainerName)
-{
-    Write-Host "Using Az module authentication"
-
-    # Verify Az.Storage module
-    if (-not (Get-Module -ListAvailable -Name Az.Storage))
-    {
-        throw "Az.Storage module not found. Install with: Install-Module Az.Storage -Scope CurrentUser"
-    }
-}
-else
-{
-    throw "Must specify either -ContainerUrl (SAS token) OR -StorageAccountName and -ContainerName (Az module)"
-}
+Write-Host "Using SAS URL to connect to blob storage"
 
 # Validate mapping CSV
 if (-not (Test-Path $MappingCsvPath))
@@ -192,77 +153,48 @@ Write-Host "Scanning blob storage for PST files..."
 
 $pstBlobs = @()
 
-if ($useSasToken)
+# Parse SAS URL
+$uri = [System.Uri]$SasUrl
+$baseUrl = "$($uri.Scheme)://$($uri.Host)$($uri.AbsolutePath)"
+$sasToken = $uri.Query
+
+# List blobs using REST API
+$marker = $null
+do
 {
-    # Parse container URL
-    $uri = [System.Uri]$ContainerUrl
-    $baseUrl = "$($uri.Scheme)://$($uri.Host)$($uri.AbsolutePath)"
-    $sasToken = $uri.Query
-
-    # List blobs using REST API
-    $marker = $null
-    do
-    {
-        $listUrl = "$baseUrl$sasToken&restype=container&comp=list"
-        if ($BlobPrefix)
-        {
-            $listUrl += "&prefix=$([System.Web.HttpUtility]::UrlEncode($BlobPrefix))"
-        }
-        if ($marker)
-        {
-            $listUrl += "&marker=$marker"
-        }
-
-        try
-        {
-            $response = Invoke-RestMethod -Uri $listUrl -Method Get
-            $blobs = $response.EnumerationResults.Blobs.Blob
-
-            foreach ($blob in $blobs)
-            {
-                if ($blob.Name -like "*.pst")
-                {
-                    $pstBlobs += [PSCustomObject]@{
-                        Name = $blob.Name
-                        Size = [long]$blob.Properties.'Content-Length'
-                    }
-                }
-            }
-
-            $marker = $response.EnumerationResults.NextMarker
-        }
-        catch
-        {
-            throw "Failed to list blobs: $($_.Exception.Message)"
-        }
-    } while ($marker)
-}
-else
-{
-    # Use Az module
-    Import-Module Az.Storage -ErrorAction Stop
-
-    $context = New-AzStorageContext -StorageAccountName $StorageAccountName -UseConnectedAccount
-
-    $listParams = @{
-        Container = $ContainerName
-        Context   = $context
-    }
+    $listUrl = "$baseUrl$sasToken&restype=container&comp=list"
     if ($BlobPrefix)
     {
-        $listParams.Prefix = $BlobPrefix
+        $listUrl += "&prefix=$([System.Web.HttpUtility]::UrlEncode($BlobPrefix))"
     }
-
-    $blobs = Get-AzStorageBlob @listParams | Where-Object { $_.Name -like "*.pst" }
-
-    foreach ($blob in $blobs)
+    if ($marker)
     {
-        $pstBlobs += [PSCustomObject]@{
-            Name = $blob.Name
-            Size = $blob.Length
-        }
+        $listUrl += "&marker=$marker"
     }
-}
+
+    try
+    {
+        $response = Invoke-RestMethod -Uri $listUrl -Method Get
+        $blobs = $response.EnumerationResults.Blobs.Blob
+
+        foreach ($blob in $blobs)
+        {
+            if ($blob.Name -like "*.pst")
+            {
+                $pstBlobs += [PSCustomObject]@{
+                    Name = $blob.Name
+                    Size = [long]$blob.Properties.'Content-Length'
+                }
+            }
+        }
+
+        $marker = $response.EnumerationResults.NextMarker
+    }
+    catch
+    {
+        throw "Failed to list blobs: $($_.Exception.Message)"
+    }
+} while ($marker)
 
 Write-Host "  PST files found: $($pstBlobs.Count)"
 #endregion
@@ -275,18 +207,10 @@ $purviewMapping = @()
 $unmatchedBlobs = @()
 $matchedCount = 0
 
-# Determine FilePath value
+# Determine FilePath value (container name from URL)
 if (-not $FilePath)
 {
-    if ($useSasToken)
-    {
-        $uri = [System.Uri]$ContainerUrl
-        $FilePath = $uri.AbsolutePath.TrimStart('/')
-    }
-    else
-    {
-        $FilePath = $ContainerName
-    }
+    $FilePath = $uri.AbsolutePath.TrimStart('/')
 }
 
 foreach ($blob in $pstBlobs)
