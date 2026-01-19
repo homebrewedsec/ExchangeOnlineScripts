@@ -227,19 +227,34 @@ do
         {
             Write-Host "  EnumerationResults children:" -ForegroundColor Yellow
             $xmlResponse.EnumerationResults.ChildNodes | ForEach-Object {
-                Write-Host "    - $($_.Name): $($_.InnerText.Substring(0, [Math]::Min(50, $_.InnerText.Length)))" -ForegroundColor Gray
+                $innerText = if ($_.InnerText) { $_.InnerText.Substring(0, [Math]::Min(100, $_.InnerText.Length)) } else { "(empty)" }
+                Write-Host "    - $($_.Name): $innerText" -ForegroundColor Gray
+            }
+            # Check if Blobs element exists but is empty
+            if ($xmlResponse.EnumerationResults.Blobs)
+            {
+                Write-Host "  Blobs element exists but may be empty" -ForegroundColor Yellow
+                Write-Host "  Blobs children count: $($xmlResponse.EnumerationResults.Blobs.ChildNodes.Count)" -ForegroundColor Yellow
             }
         }
         else
         {
-            Write-Host "  Raw XML (first 500 chars):" -ForegroundColor Yellow
-            Write-Host "  $($rawResponse.Content.Substring(0, [Math]::Min(500, $rawResponse.Content.Length)))" -ForegroundColor Gray
+            Write-Host "  Raw XML (first 1000 chars):" -ForegroundColor Yellow
+            Write-Host "  $($rawResponse.Content.Substring(0, [Math]::Min(1000, $rawResponse.Content.Length)))" -ForegroundColor Gray
         }
 
         # Debug: Show what we got back
         if ($null -eq $blobs)
         {
-            Write-Host "  No blobs found in response" -ForegroundColor Yellow
+            Write-Host "  No blobs found in response - container may be empty or check BlobPrefix" -ForegroundColor Yellow
+        }
+        else
+        {
+            # Show first 5 blob names (any type, not just PST)
+            Write-Host "  First few blobs found:" -ForegroundColor Gray
+            $blobs | Select-Object -First 5 | ForEach-Object {
+                Write-Host "    $($_.Name)" -ForegroundColor Gray
+            }
         }
 
         foreach ($blob in $blobs)
