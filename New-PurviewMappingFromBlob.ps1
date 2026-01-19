@@ -15,8 +15,9 @@
     Example: "https://storageaccount.blob.core.windows.net/container?sv=2022-11-02&ss=b..."
 
 .PARAMETER MappingCsvPath
-    Path to the source-to-target email mapping CSV.
-    Required columns: SourceEmail (or SourceUPN) and TargetEmail (or TargetUPN).
+    Optional. Path to the source-to-target email mapping CSV.
+    If not provided, emails are extracted from PST filenames and used as both source and target.
+    Required columns if provided: SourceEmail (or SourceUPN) and TargetEmail (or TargetUPN).
 
 .PARAMETER FilePath
     The FilePath value for the Purview mapping (folder within container).
@@ -52,7 +53,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$SasUrl,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $false)]
     [string]$MappingCsvPath,
 
     [string]$FilePath,
@@ -73,10 +74,19 @@ $script:UnmatchedCsvPath = Join-Path $OutputPath "UnmatchedBlobs_$script:Timesta
 #region VALIDATION
 Write-Host "Using SAS URL to connect to blob storage"
 
-# Validate mapping CSV
-if (-not (Test-Path $MappingCsvPath))
+# Validate mapping CSV if provided
+$useMapping = $false
+if ($MappingCsvPath)
 {
-    throw "Mapping CSV not found: $MappingCsvPath"
+    if (-not (Test-Path $MappingCsvPath))
+    {
+        throw "Mapping CSV not found: $MappingCsvPath"
+    }
+    $useMapping = $true
+}
+else
+{
+    Write-Host "No mapping CSV provided - will extract emails from filenames and use as target"
 }
 
 # Validate append target if specified
@@ -92,57 +102,61 @@ if (-not (Test-Path $OutputPath))
 }
 #endregion
 
-#region LOAD MAPPING CSV
-Write-Host "Loading source-to-target mapping: $MappingCsvPath"
-$mappingData = Import-Csv -Path $MappingCsvPath
-
-# Detect column names (flexible naming)
-$sourceCol = $null
-$targetCol = $null
-
-$possibleSourceCols = @("SourceEmail", "SourceUPN", "sourceEmail", "sourceUPN", "Source")
-$possibleTargetCols = @("TargetEmail", "TargetUPN", "targetEmail", "targetUPN", "Target")
-
-foreach ($col in $possibleSourceCols)
-{
-    if ($mappingData | Get-Member -Name $col -MemberType NoteProperty)
-    {
-        $sourceCol = $col
-        break
-    }
-}
-
-foreach ($col in $possibleTargetCols)
-{
-    if ($mappingData | Get-Member -Name $col -MemberType NoteProperty)
-    {
-        $targetCol = $col
-        break
-    }
-}
-
-if (-not $sourceCol -or -not $targetCol)
-{
-    throw "Mapping CSV must have source column ($($possibleSourceCols -join ', ')) and target column ($($possibleTargetCols -join ', '))"
-}
-
-Write-Host "  Source column: $sourceCol"
-Write-Host "  Target column: $targetCol"
-Write-Host "  Mappings loaded: $($mappingData.Count)"
-
-# Build lookup hashtable (encoded email -> target email)
+#region LOAD MAPPING CSV (OPTIONAL)
 $emailLookup = @{}
-foreach ($row in $mappingData)
-{
-    $sourceEmail = $row.$sourceCol
-    $targetEmail = $row.$targetCol
 
-    if ($sourceEmail -and $targetEmail)
+if ($useMapping)
+{
+    Write-Host "Loading source-to-target mapping: $MappingCsvPath"
+    $mappingData = Import-Csv -Path $MappingCsvPath
+
+    # Detect column names (flexible naming)
+    $sourceCol = $null
+    $targetCol = $null
+
+    $possibleSourceCols = @("SourceEmail", "SourceUPN", "sourceEmail", "sourceUPN", "Source")
+    $possibleTargetCols = @("TargetEmail", "TargetUPN", "targetEmail", "targetUPN", "Target")
+
+    foreach ($col in $possibleSourceCols)
     {
-        # Store both original and encoded versions
-        $emailLookup[$sourceEmail.ToLower()] = $targetEmail
-        $encoded = ($sourceEmail -replace "@", "_at_" -replace "\.", "_").ToLower()
-        $emailLookup[$encoded] = $targetEmail
+        if ($mappingData | Get-Member -Name $col -MemberType NoteProperty)
+        {
+            $sourceCol = $col
+            break
+        }
+    }
+
+    foreach ($col in $possibleTargetCols)
+    {
+        if ($mappingData | Get-Member -Name $col -MemberType NoteProperty)
+        {
+            $targetCol = $col
+            break
+        }
+    }
+
+    if (-not $sourceCol -or -not $targetCol)
+    {
+        throw "Mapping CSV must have source column ($($possibleSourceCols -join ', ')) and target column ($($possibleTargetCols -join ', '))"
+    }
+
+    Write-Host "  Source column: $sourceCol"
+    Write-Host "  Target column: $targetCol"
+    Write-Host "  Mappings loaded: $($mappingData.Count)"
+
+    # Build lookup hashtable (encoded email -> target email)
+    foreach ($row in $mappingData)
+    {
+        $sourceEmail = $row.$sourceCol
+        $targetEmail = $row.$targetCol
+
+        if ($sourceEmail -and $targetEmail)
+        {
+            # Store both original and encoded versions
+            $emailLookup[$sourceEmail.ToLower()] = $targetEmail
+            $encoded = ($sourceEmail -replace "@", "_at_" -replace "\.", "_").ToLower()
+            $emailLookup[$encoded] = $targetEmail
+        }
     }
 }
 #endregion
@@ -240,10 +254,28 @@ foreach ($blob in $pstBlobs)
 
     if ($extractedEmail)
     {
-        $lookupKey = $extractedEmail.ToLower()
-        if ($emailLookup.ContainsKey($lookupKey))
+        if ($useMapping)
         {
-            $targetEmail = $emailLookup[$lookupKey]
+            # Look up target email from mapping CSV
+            $lookupKey = $extractedEmail.ToLower()
+            if ($emailLookup.ContainsKey($lookupKey))
+            {
+                $targetEmail = $emailLookup[$lookupKey]
+            }
+        }
+        else
+        {
+            # No mapping CSV - convert encoded email back to proper format and use as target
+            # Pattern: user_at_domain_com -> user@domain.com
+            $targetEmail = $extractedEmail -replace '_at_', '@'
+            # Replace remaining underscores with dots (for domain parts)
+            # But need to be careful - only replace underscores that are part of the domain
+            if ($targetEmail -match '^([^@]+)@(.+)$')
+            {
+                $localPart = $Matches[1]
+                $domainPart = $Matches[2] -replace '_', '.'
+                $targetEmail = "$localPart@$domainPart"
+            }
         }
     }
 
@@ -254,7 +286,7 @@ foreach ($blob in $pstBlobs)
             FilePath            = $FilePath
             Name                = $pstFileName
             Mailbox             = $targetEmail
-            IsArchive           = "TRUE"
+            IsArchive           = "FALSE"
             TargetRootFolder    = "/"
             ContentCodePage     = ""
             SPFileContainer     = ""
