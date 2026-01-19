@@ -201,8 +201,18 @@ do
         $rawResponse = Invoke-WebRequest -Uri $listUrl -Method Get -UseBasicParsing
         Write-Host "  Response status: $($rawResponse.StatusCode)" -ForegroundColor Gray
 
-        # Parse as XML
-        [xml]$xmlResponse = $rawResponse.Content
+        # Parse as XML - handle encoding issues
+        $xmlContent = $rawResponse.Content
+        # Remove BOM if present
+        if ($xmlContent -is [byte[]])
+        {
+            $xmlContent = [System.Text.Encoding]::UTF8.GetString($xmlContent)
+        }
+        # Remove any leading whitespace or BOM characters
+        $xmlContent = $xmlContent.TrimStart([char]0xFEFF, [char]0xFFFE, ' ', "`t", "`r", "`n")
+
+        $xmlResponse = New-Object System.Xml.XmlDocument
+        $xmlResponse.LoadXml($xmlContent)
 
         # Debug: Show XML structure
         Write-Host "  XML root element: $($xmlResponse.DocumentElement.Name)" -ForegroundColor Gray
