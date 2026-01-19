@@ -195,21 +195,51 @@ do
 
     try
     {
-        $response = Invoke-RestMethod -Uri $listUrl -Method Get
-        $blobs = $response.EnumerationResults.Blobs.Blob
+        Write-Host "  Calling: $($listUrl.Substring(0, [Math]::Min(100, $listUrl.Length)))..." -ForegroundColor Gray
+
+        # Get raw response first to debug
+        $rawResponse = Invoke-WebRequest -Uri $listUrl -Method Get -UseBasicParsing
+        Write-Host "  Response status: $($rawResponse.StatusCode)" -ForegroundColor Gray
+
+        # Parse as XML
+        [xml]$xmlResponse = $rawResponse.Content
+
+        # Debug: Show XML structure
+        Write-Host "  XML root element: $($xmlResponse.DocumentElement.Name)" -ForegroundColor Gray
+
+        # Try different XML paths
+        $blobs = $null
+
+        # Path 1: EnumerationResults/Blobs/Blob (standard)
+        if ($xmlResponse.EnumerationResults.Blobs.Blob)
+        {
+            $blobs = $xmlResponse.EnumerationResults.Blobs.Blob
+            Write-Host "  Found blobs at: EnumerationResults/Blobs/Blob" -ForegroundColor Green
+        }
+        # Path 2: Direct Blobs/Blob
+        elseif ($xmlResponse.Blobs.Blob)
+        {
+            $blobs = $xmlResponse.Blobs.Blob
+            Write-Host "  Found blobs at: Blobs/Blob" -ForegroundColor Green
+        }
+        # Path 3: Check what's in EnumerationResults
+        elseif ($xmlResponse.EnumerationResults)
+        {
+            Write-Host "  EnumerationResults children:" -ForegroundColor Yellow
+            $xmlResponse.EnumerationResults.ChildNodes | ForEach-Object {
+                Write-Host "    - $($_.Name): $($_.InnerText.Substring(0, [Math]::Min(50, $_.InnerText.Length)))" -ForegroundColor Gray
+            }
+        }
+        else
+        {
+            Write-Host "  Raw XML (first 500 chars):" -ForegroundColor Yellow
+            Write-Host "  $($rawResponse.Content.Substring(0, [Math]::Min(500, $rawResponse.Content.Length)))" -ForegroundColor Gray
+        }
 
         # Debug: Show what we got back
         if ($null -eq $blobs)
         {
-            Write-Host "  No blobs returned in this batch" -ForegroundColor Yellow
-            # Check if response has different structure
-            if ($response.EnumerationResults)
-            {
-                Write-Host "  EnumerationResults found, checking structure..." -ForegroundColor Yellow
-                $response.EnumerationResults | Get-Member -MemberType Property | ForEach-Object {
-                    Write-Host "    Property: $($_.Name)" -ForegroundColor Gray
-                }
-            }
+            Write-Host "  No blobs found in response" -ForegroundColor Yellow
         }
 
         foreach ($blob in $blobs)
@@ -226,7 +256,7 @@ do
             }
         }
 
-        $marker = $response.EnumerationResults.NextMarker
+        $marker = $xmlResponse.EnumerationResults.NextMarker
     }
     catch
     {
