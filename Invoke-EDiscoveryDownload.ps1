@@ -49,6 +49,14 @@
     successfully (Status not "Success" or "Skipped") will be downloaded. Use this to resume
     interrupted downloads without re-downloading completed files.
 
+.PARAMETER VerifyExisting
+    When used with -ResumeFrom, also verifies that existing files' sizes match expected sizes.
+    Files with size mismatches will be re-downloaded. Use to catch silent corruption.
+
+.PARAMETER ReDownloadFrom
+    Path to a quality check CSV file (from Test-EDiscoveryQuality.ps1). Only files with
+    Status starting with "Fail_" will be downloaded. Use this to re-download corrupt files.
+
 .EXAMPLE
     .\Invoke-EDiscoveryDownload.ps1 -CaseName "ArchiveExport" -ClientId "c8fab561-2078-48cb-8f93-3789d1d72e8a"
     Downloads all PST files from the case matching "ArchiveExport".
@@ -101,7 +109,11 @@ param(
 
     [int]$ThrottleLimit = 1,
 
-    [string]$ResumeFrom
+    [string]$ResumeFrom,
+
+    [switch]$VerifyExisting,
+
+    [string]$ReDownloadFrom
 )
 
 #region CONFIGURATION
@@ -326,7 +338,51 @@ try
         Write-Log "Filtering files based on previous run: $ResumeFrom"
 
         $previousRun = Import-Csv -Path $ResumeFrom
-        $completedFiles = $previousRun | Where-Object { $_.Status -in @("Success", "Skipped") } | Select-Object -ExpandProperty FileName
+        $completedFiles = @($previousRun | Where-Object { $_.Status -in @("Success", "Skipped") } | Select-Object -ExpandProperty FileName)
+
+        # If VerifyExisting is set, check file sizes for completed files
+        if ($VerifyExisting -and $completedFiles.Count -gt 0)
+        {
+            Write-Log "Verifying existing file sizes..."
+            $verifyFailed = @()
+
+            foreach ($prevFile in ($previousRun | Where-Object { $_.Status -eq "Success" }))
+            {
+                $localPath = Join-Path $OutputPath $prevFile.FileName
+                if (Test-Path $localPath)
+                {
+                    $actualSize = (Get-Item $localPath).Length
+                    $expectedSize = [long]($prevFile.SizeMB * 1MB)
+                    $tolerance = [math]::Max($expectedSize * 0.01, 1024)  # 1% or 1KB minimum
+
+                    if ([math]::Abs($actualSize - $expectedSize) -gt $tolerance)
+                    {
+                        Write-Log "  Size mismatch: $($prevFile.FileName) (actual: $actualSize, expected: $expectedSize)" -Level WARNING
+                        $verifyFailed += $prevFile.FileName
+                    }
+                    elseif ($actualSize -lt 1000)
+                    {
+                        Write-Log "  Too small: $($prevFile.FileName) ($actualSize bytes)" -Level WARNING
+                        $verifyFailed += $prevFile.FileName
+                    }
+                }
+                else
+                {
+                    Write-Log "  Missing: $($prevFile.FileName)" -Level WARNING
+                    $verifyFailed += $prevFile.FileName
+                }
+            }
+
+            if ($verifyFailed.Count -gt 0)
+            {
+                Write-Log "  Verification failed: $($verifyFailed.Count) file(s) need re-download" -Level WARNING
+                $completedFiles = $completedFiles | Where-Object { $_ -notin $verifyFailed }
+            }
+            else
+            {
+                Write-Log "  All existing files verified successfully" -Level SUCCESS
+            }
+        }
 
         $originalCount = $downloadFiles.Count
         $downloadFiles = $downloadFiles | Where-Object { $_.FileName -notin $completedFiles }
@@ -339,6 +395,45 @@ try
         {
             Write-Log ""
             Write-Log "All files already completed. Nothing to download." -Level SUCCESS
+            return
+        }
+
+        Write-Log ""
+    }
+    #endregion
+
+    #region REDOWNLOAD FROM QUALITY CHECK
+    if ($ReDownloadFrom)
+    {
+        if (-not (Test-Path $ReDownloadFrom))
+        {
+            throw "Quality check file not found: $ReDownloadFrom"
+        }
+
+        Write-Log "Loading quality check results: $ReDownloadFrom"
+
+        $qualityResults = Import-Csv -Path $ReDownloadFrom
+        $failedFiles = @($qualityResults | Where-Object { $_.Status -like "Fail_*" } | Select-Object -ExpandProperty FileName)
+
+        Write-Log "  Files flagged for re-download: $($failedFiles.Count)"
+
+        if ($failedFiles.Count -eq 0)
+        {
+            Write-Log ""
+            Write-Log "No failed files in quality check. Nothing to re-download." -Level SUCCESS
+            return
+        }
+
+        # Filter downloadFiles to only include failed items
+        $originalCount = $downloadFiles.Count
+        $downloadFiles = $downloadFiles | Where-Object { $_.FileName -in $failedFiles }
+
+        Write-Log "  Matched in export: $($downloadFiles.Count) files" -Level PROGRESS
+
+        if ($downloadFiles.Count -eq 0)
+        {
+            Write-Log ""
+            Write-Log "No matching files found in current export. Check that you're using the correct case." -Level WARNING
             return
         }
 
