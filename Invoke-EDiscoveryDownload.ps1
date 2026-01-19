@@ -413,6 +413,15 @@ try
         Write-Log "Loading quality check results: $ReDownloadFrom"
 
         $qualityResults = Import-Csv -Path $ReDownloadFrom
+
+        # Use FolderPath from quality check CSV if OutputPath wasn't explicitly specified
+        $qualityFolderPath = $qualityResults | Select-Object -First 1 -ExpandProperty FolderPath -ErrorAction SilentlyContinue
+        if ($qualityFolderPath -and ($OutputPath -eq (Get-Location).Path))
+        {
+            $OutputPath = $qualityFolderPath
+            Write-Log "  Using folder from quality check: $OutputPath"
+        }
+
         $failedFiles = @($qualityResults | Where-Object { $_.Status -like "Fail_*" } | Select-Object -ExpandProperty FileName)
 
         Write-Log "  Files flagged for re-download: $($failedFiles.Count)"
